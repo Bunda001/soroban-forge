@@ -9,6 +9,13 @@
 //!   losing side's stakes are what pays the winning side's profit.
 //! * **Oracle** — `resolve` is gated on one address fixed at deploy time.
 //!   Nobody else can report an outcome, and it can only be reported once.
+//! * **Deadline** — the market has a resolution deadline (a ledger timestamp)
+//!   fixed at deploy time. `stake` and `resolve` only work before it; from the
+//!   deadline on, the market is closed to both.
+//! * **Refunds** — if the deadline passes and the oracle never resolved the
+//!   market (lost key, abandoned market), `refund` lets each participant take
+//!   back exactly what they staked, on both sides. Stakes are never locked
+//!   forever.
 //! * **Pull payments** — nothing is pushed on resolution. Each winner claims
 //!   their own payout, exactly once.
 //! * **Rounding** — payouts are floor-divided, so up to `winning_pool - 1`
@@ -17,9 +24,10 @@
 //! Two edges this template deliberately leaves open, both worth closing
 //! before using it for real:
 //!
-//! * There is no staking deadline — the market accepts stakes right up until
-//!   the oracle resolves it, so someone who learns the outcome early can
-//!   still buy in. A real market closes staking before the event settles.
+//! * There is no betting cutoff earlier than the resolution deadline — the
+//!   market accepts stakes until the oracle resolves it or the deadline is
+//!   reached, whichever comes first, so someone who learns the outcome early
+//!   can still buy in. A real market closes staking before the event settles.
 //! * If the oracle resolves to a side nobody staked, there are no winners and
 //!   the pool stays in the contract; every `claim` reports `NothingToClaim`.
 //!
@@ -44,10 +52,16 @@ pub enum Error {
     NotResolved = 3,
     /// Caller is not the designated oracle.
     NotOracle = 4,
-    /// This address has already taken its payout.
+    /// This address has already taken its payout or refund.
     AlreadyClaimed = 5,
     /// Nothing is owed to this address.
     NothingToClaim = 6,
+    /// The deadline given to the constructor is not in the future.
+    DeadlineInPast = 7,
+    /// The resolution deadline has been reached: staking and resolving are closed.
+    DeadlinePassed = 8,
+    /// The resolution deadline has not been reached yet: refunds are not open.
+    DeadlineNotReached = 9,
 }
 
 #[contracttype]
@@ -57,13 +71,16 @@ pub enum DataKey {
     Oracle,
     /// SEP-41 token stakes are denominated in.
     Token,
+    /// Ledger timestamp from which the market is closed to staking and
+    /// resolving, and open to refunds if it was never resolved.
+    Deadline,
     /// The winning outcome. Its *presence* is what marks the market resolved.
     Outcome,
     /// Total staked on one outcome.
     Pool(bool),
     /// One address's stake on one outcome.
     Stake(Address, bool),
-    /// Whether an address has taken its payout.
+    /// Whether an address has taken its payout or refund.
     Claimed(Address),
 }
 
@@ -73,6 +90,17 @@ fn oracle(env: &Env) -> Address {
 
 fn token_address(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Token).unwrap()
+}
+
+fn deadline(env: &Env) -> u64 {
+    env.storage().instance().get(&DataKey::Deadline).unwrap()
+}
+
+/// Whether the resolution deadline has been reached. The deadline instant
+/// itself counts as reached, so "before the deadline" and "from the deadline
+/// on" are exact complements.
+fn deadline_reached(env: &Env) -> bool {
+    env.ledger().timestamp() >= deadline(env)
 }
 
 /// The winning outcome, or `None` while the market is still open.
@@ -114,16 +142,23 @@ impl PredictionMarketContract {
     ///
     /// * `oracle` — the only address that will be able to `resolve`
     /// * `token` — address of the token stakes are made in
-    pub fn __constructor(env: Env, oracle: Address, token: Address) {
+    /// * `deadline` — unix timestamp (seconds) from which staking and
+    ///   resolving are closed; an unresolved market can be refunded from then
+    ///   on. Must be in the future.
+    pub fn __constructor(env: Env, oracle: Address, token: Address, deadline: u64) {
+        if deadline <= env.ledger().timestamp() {
+            panic_with_error!(&env, Error::DeadlineInPast);
+        }
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::Token, &token);
+        env.storage().instance().set(&DataKey::Deadline, &deadline);
     }
 
     /// Stake `amount` on an outcome — `true` for YES, `false` for NO.
     ///
     /// The tokens are transferred into the contract's escrow. Staking is only
-    /// possible while the market is unresolved; an address may stake more
-    /// than once, and may stake on both sides.
+    /// possible while the market is unresolved and before the deadline; an
+    /// address may stake more than once, and may stake on both sides.
     pub fn stake(env: Env, from: Address, outcome: bool, amount: i128) {
         from.require_auth();
         if amount <= 0 {
@@ -131,6 +166,9 @@ impl PredictionMarketContract {
         }
         if resolved_outcome(&env).is_some() {
             panic_with_error!(&env, Error::AlreadyResolved);
+        }
+        if deadline_reached(&env) {
+            panic_with_error!(&env, Error::DeadlinePassed);
         }
 
         token::Client::new(&env, &token_address(&env)).transfer(
@@ -151,8 +189,8 @@ impl PredictionMarketContract {
             .publish((symbol_short!("stake"), from, outcome), amount);
     }
 
-    /// Report the winning outcome. Only the oracle may call this, and only
-    /// once.
+    /// Report the winning outcome. Only the oracle may call this, only once,
+    /// and only before the deadline.
     ///
     /// `caller` is passed explicitly rather than authorizing the stored
     /// oracle directly, so the address that signed is checked against the
@@ -164,6 +202,9 @@ impl PredictionMarketContract {
         }
         if resolved_outcome(&env).is_some() {
             panic_with_error!(&env, Error::AlreadyResolved);
+        }
+        if deadline_reached(&env) {
+            panic_with_error!(&env, Error::DeadlinePassed);
         }
         env.storage().instance().set(&DataKey::Outcome, &outcome);
 
@@ -209,6 +250,46 @@ impl PredictionMarketContract {
         payout
     }
 
+    /// Take back everything `to` staked, on both sides, and return the amount
+    /// transferred. Only possible once the deadline has been reached without
+    /// the market ever having been resolved — the way out when the oracle
+    /// never reports.
+    ///
+    /// Anyone may trigger a refund on a participant's behalf — the funds
+    /// always go back to `to`. Each address can be refunded exactly once, and
+    /// the refund is marked with the same flag as a payout. `resolve` is
+    /// closed from the deadline on, so a market that reaches it unresolved
+    /// can never become claimable: `claim` and `refund` never both apply.
+    pub fn refund(env: Env, to: Address) -> i128 {
+        if resolved_outcome(&env).is_some() {
+            panic_with_error!(&env, Error::AlreadyResolved);
+        }
+        if !deadline_reached(&env) {
+            panic_with_error!(&env, Error::DeadlineNotReached);
+        }
+        if claimed(&env, &to) {
+            panic_with_error!(&env, Error::AlreadyClaimed);
+        }
+
+        let amount = stake_of(&env, &to, true) + stake_of(&env, &to, false);
+        if amount == 0 {
+            panic_with_error!(&env, Error::NothingToClaim);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Claimed(to.clone()), &true);
+
+        token::Client::new(&env, &token_address(&env)).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
+
+        env.events().publish((symbol_short!("refund"), to), amount);
+        amount
+    }
+
     // --- read-only getters ---
 
     pub fn get_oracle(env: Env) -> Address {
@@ -217,6 +298,11 @@ impl PredictionMarketContract {
 
     pub fn get_token(env: Env) -> Address {
         token_address(&env)
+    }
+
+    /// The ledger timestamp from which the market is closed.
+    pub fn get_deadline(env: Env) -> u64 {
+        deadline(&env)
     }
 
     /// The winning outcome, or `None` while the market is unresolved.
@@ -239,7 +325,7 @@ impl PredictionMarketContract {
         stake_of(&env, &who, outcome)
     }
 
-    /// Whether `who` has already taken their payout.
+    /// Whether `who` has already taken their payout or refund.
     pub fn has_claimed(env: Env, who: Address) -> bool {
         claimed(&env, &who)
     }

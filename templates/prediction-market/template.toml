@@ -2,7 +2,8 @@ description = "binary outcome market with oracle resolution and parimutuel payou
 
 [post_generate]
 hints = [
-  "deploy args: --oracle <ADDRESS> --token <ADDRESS>",
-  "only the oracle address can call resolve() — pick it before deploying, it is fixed at construction",
+  "deploy args: --oracle <ADDRESS> --token <ADDRESS> --deadline <UNIX_TIMESTAMP>",
+  "only the oracle address can call resolve() — and only before the deadline; both are fixed at construction, so pick them before deploying",
+  "if the oracle never resolves, anyone can call refund(<participant>) once the deadline has passed to return that participant's stakes",
   "outcomes are booleans: true = YES, false = NO",
 ]
