@@ -15,8 +15,14 @@
 //! `rename` across filesystems is not atomic and fails outright, and the
 //! system temp directory is frequently on a different mount than `~/.config`.
 
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{ForgeError, Result};
 
@@ -25,6 +31,30 @@ use crate::{ForgeError, Result};
 /// On success the destination holds exactly `contents`. On failure the previous
 /// contents are left untouched.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_inner(path, contents, |tmp| File::create(tmp))
+}
+
+/// Write `contents` atomically, creating the temporary file with `mode`.
+///
+/// The mode is applied before any contents are written.
+#[cfg(unix)]
+pub fn write_atomic_with_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    write_atomic_inner(path, contents, |tmp| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(tmp)?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        Ok(file)
+    })
+}
+
+fn write_atomic_inner(
+    path: &Path,
+    contents: &str,
+    create_temp: impl FnOnce(&Path) -> std::io::Result<File>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(ForgeError::io(format!("creating {}", parent.display())))?;
@@ -34,7 +64,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     // Scope the write so the file is closed (flushed to the OS) before the
     // rename. `rename` on an open file is fine on Unix but not on Windows.
     {
-        let mut file = std::fs::File::create(&tmp)
+        let mut file = create_temp(&tmp)
             .map_err(ForgeError::io(format!("creating {}", tmp.display())))?;
         file.write_all(contents.as_bytes())
             .map_err(ForgeError::io(format!("writing {}", tmp.display())))?;

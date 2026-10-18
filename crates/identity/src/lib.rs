@@ -1,6 +1,6 @@
 //! # soroban-forge-identity
 //!
-//! `soroban-forge identity generate|import|list|show|fund|remove` — manage
+//! `soroban-forge identity generate|import|list|show|fund|balance|remove` — manage
 //! test keypairs and fund them via friendbot on testnet.
 //!
 //! Identities are stored as a JSON file at
@@ -67,12 +67,16 @@ pub fn load_store(path: &PathBuf) -> Result<IdentityStore> {
 /// Writes through [`soroban_forge_core::atomic::write_atomic`] (#470): a crash
 /// or disk-full error partway through must not leave `identities.json`
 /// truncated, because the next `load_store` would then fail to parse and every
-/// stored identity would be lost.
+/// stored identity would be lost. On Unix, the replacement file is created
+/// with mode `0600` so secret keys are never written with broader permissions.
 pub fn save_store(path: &PathBuf, store: &IdentityStore) -> Result<()> {
     let json = serde_json::to_string_pretty(store)
         .map_err(|e| ForgeError::Other(format!("serializing identity store: {e}")))?;
-    soroban_forge_core::atomic::write_atomic(path, &json)
-        .map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
+    #[cfg(unix)]
+    let result = soroban_forge_core::atomic::write_atomic_with_mode(path, &json, 0o600);
+    #[cfg(not(unix))]
+    let result = soroban_forge_core::atomic::write_atomic(path, &json);
+    result.map_err(|e| ForgeError::Other(format!("writing {}: {e}", path.display())))
 }
 
 /// Read the store, let `f` mutate it, and save it back — all with the store
@@ -414,8 +418,30 @@ pub fn friendbot_url(public_key: &str, network_passphrase: Option<&str>) -> Opti
     Some(format!("{host}/?addr={public_key}"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FundingOutcome {
+    Funded { balance_xlm: String },
+    AlreadyFunded { balance_xlm: Option<String> },
+}
+
+impl FundingOutcome {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Funded { .. } => "funded",
+            Self::AlreadyFunded { .. } => "already_funded",
+        }
+    }
+
+    fn balance_xlm(&self) -> Option<&str> {
+        match self {
+            Self::Funded { balance_xlm } => Some(balance_xlm),
+            Self::AlreadyFunded { balance_xlm } => balance_xlm.as_deref(),
+        }
+    }
+}
+
 /// Fund a Stellar testnet/futurenet account via friendbot.
-/// Returns the parsed balance (in XLM) on success.
+/// Returns whether this request newly funded the account or found it already funded.
 ///
 /// The friendbot host is chosen from the effective network passphrase (#471):
 /// testnet and futurenet have separate deployments. Mainnet, and any passphrase
@@ -425,7 +451,7 @@ pub fn fund_friendbot(
     public_key: &str,
     network_passphrase: Option<&str>,
     timeout: Option<Duration>,
-) -> Result<String> {
+) -> Result<FundingOutcome> {
     // #287 — refuse to run on mainnet
     let Some(passphrase) = network_passphrase else {
         return Err(ForgeError::InvalidArgument(
@@ -459,16 +485,53 @@ pub fn fund_friendbot(
         .into_string()
         .map_err(|e| ForgeError::Other(format!("reading friendbot response: {e}")))?;
 
-    // Try to parse the balance from the horizon response.
-    // Friendbot returns the created account record; the native balance lives in balances[].
-    let balance = parse_native_balance(&body).unwrap_or_else(|| "unknown".to_string());
-    Ok(balance)
+    parse_friendbot_response(&body)
+}
+
+fn parse_friendbot_response(body: &str) -> Result<FundingOutcome> {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let lower_body = body.to_ascii_lowercase();
+    let already_funded = lower_body.contains("already funded")
+        || lower_body.contains("already been funded")
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("already_funded"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("already_funded"));
+
+    if already_funded {
+        return Ok(FundingOutcome::AlreadyFunded {
+            balance_xlm: parsed.as_ref().and_then(parse_native_balance_value),
+        });
+    }
+
+    if let Some(balance_xlm) = parsed.as_ref().and_then(parse_native_balance_value) {
+        return Ok(FundingOutcome::Funded { balance_xlm });
+    }
+
+    let detail = parsed
+        .as_ref()
+        .and_then(|value| value.get("detail").or_else(|| value.get("message")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(body.trim());
+    Err(ForgeError::Other(format!(
+        "friendbot returned a success response without confirming funding: {detail}"
+    )))
 }
 
 /// Extract the native XLM balance from a Horizon account JSON response.
 fn parse_native_balance(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let balances = v.get("balances")?.as_array()?;
+    parse_native_balance_value(&v)
+}
+
+fn parse_native_balance_value(value: &serde_json::Value) -> Option<String> {
+    let balances = value.get("balances")?.as_array()?;
     for b in balances {
         if b.get("asset_type")?.as_str()? == "native" {
             let bal = b.get("balance")?.as_str()?;
@@ -476,6 +539,49 @@ fn parse_native_balance(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn horizon_url_for_passphrase(passphrase: &str) -> Option<&'static str> {
+    if passphrase.contains("Future Network") {
+        Some("https://horizon-futurenet.stellar.org")
+    } else if passphrase.contains("Test SDF Network") {
+        Some("https://horizon-testnet.stellar.org")
+    } else if passphrase.contains("Public Global Stellar Network") {
+        Some("https://horizon.stellar.org")
+    } else {
+        None
+    }
+}
+
+fn fetch_native_balance(
+    public_key: &str,
+    horizon_url: &str,
+    timeout: Option<Duration>,
+) -> Result<String> {
+    let url = format!("{}/accounts/{public_key}", horizon_url.trim_end_matches('/'));
+    let response = http_get(&url, timeout).map_err(|error| match error {
+        ureq::Error::Status(404, _) => ForgeError::InvalidArgument(format!(
+            "identity account `{public_key}` does not exist on the selected network"
+        )),
+        error => ForgeError::Other(format!("could not query identity balance: {error}")),
+    })?;
+    let body = response
+        .into_string()
+        .map_err(|error| ForgeError::Other(format!("reading Horizon response: {error}")))?;
+    parse_native_balance(&body).ok_or_else(|| {
+        ForgeError::Other("Horizon response did not contain a native XLM balance".into())
+    })
+}
+
+fn resolve_balance_network_name<'a>(
+    cli_network: Option<&'a str>,
+    configured_network: Option<&'a str>,
+    stored_default: Option<&'a str>,
+) -> &'a str {
+    cli_network
+        .or(configured_network)
+        .or(stored_default)
+        .unwrap_or("testnet")
 }
 
 /// Format the identity list for display.
@@ -625,6 +731,22 @@ impl ForgePlugin for IdentityPlugin {
                             .long("network-passphrase")
                             .value_name("PASSPHRASE")
                             .help("Network passphrase (used to refuse mainnet funding)"),
+                    ),
+            )
+            .subcommand(
+                Command::new("balance")
+                    .about("Show a stored identity's native XLM balance")
+                    .arg(
+                        Arg::new("name")
+                            .help("Name of the identity to check")
+                            .required(true),
+                    )
+                    .arg(
+                        Arg::new("network")
+                            .long("network")
+                            .short('n')
+                            .value_name("NETWORK")
+                            .help("Network to query [default: configured network or testnet]"),
                     ),
             )
             .subcommand(
@@ -884,7 +1006,7 @@ impl ForgePlugin for IdentityPlugin {
                 }
 
                 // #287 — fund_friendbot now returns the balance
-                let balance = fund_friendbot(&pubkey, effective_passphrase, ctx.timeout())?;
+                let outcome = fund_friendbot(&pubkey, effective_passphrase, ctx.timeout())?;
 
                 // Re-read under the lock rather than reusing the copy loaded
                 // before the request: another command may have written the
@@ -904,13 +1026,90 @@ impl ForgePlugin for IdentityPlugin {
                         "name": name,
                         "public_key": pubkey,
                         "funded": true,
+                        "newly_funded": outcome.status() == "funded",
+                        "status": outcome.status(),
                         "network": net_name,
+                        "balance_xlm": outcome.balance_xlm(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                } else if !ctx.quiet {
+                    match &outcome {
+                        FundingOutcome::Funded { balance_xlm } => {
+                            println!("funded `{name}` on {net_name}.");
+                            println!("  balance: {balance_xlm} XLM");
+                        }
+                        FundingOutcome::AlreadyFunded { balance_xlm } => {
+                            println!("`{name}` was already funded on {net_name}.");
+                            if let Some(balance) = balance_xlm {
+                                println!("  balance: {balance} XLM");
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            Some(("balance", sub)) => {
+                if ctx.offline {
+                    return Err(ForgeError::InvalidArgument(
+                        "identity balance is unavailable in offline mode".into(),
+                    ));
+                }
+
+                let name = sub.get_one::<String>("name").unwrap();
+                let network_path = soroban_forge_network::store_path()?;
+                let network_store = soroban_forge_network::load_store(&network_path)?;
+                let configured_network = ctx
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.network.name.as_deref());
+                let network_name = resolve_balance_network_name(
+                    sub.get_one::<String>("network").map(String::as_str),
+                    configured_network,
+                    network_store.default.as_deref(),
+                );
+                let network = soroban_forge_network::resolve_network(&network_store, network_name)
+                    .ok_or_else(|| {
+                        ForgeError::InvalidArgument(format!(
+                            "network `{network_name}` is not configured"
+                        ))
+                    })?;
+                let passphrase = if sub.get_one::<String>("network").is_none() {
+                    ctx.config
+                        .as_ref()
+                        .and_then(|config| config.network.passphrase.as_deref())
+                        .unwrap_or(&network.network_passphrase)
+                } else {
+                    &network.network_passphrase
+                };
+                let horizon_url = horizon_url_for_passphrase(passphrase).ok_or_else(|| {
+                    ForgeError::InvalidArgument(format!(
+                        "identity balance requires a known Horizon endpoint; network `{network_name}` is not supported"
+                    ))
+                })?;
+
+                let store = load_store(&path)?;
+                let identity = store.identities.get(name.as_str()).ok_or_else(|| {
+                    ForgeError::InvalidArgument(format!(
+                        "identity `{name}` not found (use `soroban-forge identity list` to see available identities)"
+                    ))
+                })?;
+                let balance = fetch_native_balance(
+                    &identity.public_key,
+                    horizon_url,
+                    ctx.timeout(),
+                )?;
+
+                if ctx.json {
+                    let report = serde_json::json!({
+                        "name": name,
+                        "public_key": identity.public_key,
+                        "network": network_name,
                         "balance_xlm": balance,
                     });
                     println!("{}", serde_json::to_string_pretty(&report).unwrap());
                 } else if !ctx.quiet {
-                    println!("funded `{name}` on {net_name}.");
-                    println!("  balance: {balance} XLM");
+                    println!("balance for `{name}` on {network_name}: {balance} XLM");
                 }
                 Ok(())
             }
@@ -1150,6 +1349,39 @@ mod tests {
     }
 
     #[test]
+    fn friendbot_already_funded_response_is_classified_from_fixture() {
+        let body = r#"{"detail":"Account already funded."}"#;
+        let outcome = parse_friendbot_response(body).unwrap();
+
+        assert_eq!(
+            outcome,
+            FundingOutcome::AlreadyFunded { balance_xlm: None }
+        );
+        assert_eq!(outcome.status(), "already_funded");
+    }
+
+    #[test]
+    fn friendbot_account_response_is_classified_as_newly_funded() {
+        let body = r#"{"balances":[{"asset_type":"native","balance":"10000.0000000"}]}"#;
+        let outcome = parse_friendbot_response(body).unwrap();
+
+        assert_eq!(
+            outcome,
+            FundingOutcome::Funded {
+                balance_xlm: "10000.0000000".into()
+            }
+        );
+        assert_eq!(outcome.status(), "funded");
+    }
+
+    #[test]
+    fn friendbot_unrecognized_success_body_is_an_error() {
+        let result = parse_friendbot_response(r#"{"detail":"temporarily unavailable"}"#);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("temporarily unavailable"), "{error}");
+    }
+
+    #[test]
     fn fund_friendbot_refuses_a_custom_passphrase() {
         // Not mainnet, but not a network with a known friendbot either: the
         // error must say so rather than defaulting to testnet.
@@ -1216,6 +1448,39 @@ mod tests {
         assert_eq!(names, vec!["identities.json".to_string()], "stray files: {names:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_store_restricts_identity_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identities.json");
+        let mut store = IdentityStore::default();
+        store.identities.insert(
+            "alice".into(),
+            Identity {
+                public_key: "GALICE".into(),
+                secret_key: "SALICE".into(),
+                funded_on: Vec::new(),
+            },
+        );
+
+        save_store(&path, &store).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        save_store(&path, &store).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1424,8 +1689,57 @@ mod tests {
         assert!(sub_names.contains(&"generate"));
         assert!(sub_names.contains(&"list"));
         assert!(sub_names.contains(&"fund"));
+        assert!(sub_names.contains(&"balance"));
         assert!(sub_names.contains(&"remove"));
         assert!(sub_names.contains(&"use"));
+    }
+
+    #[test]
+    fn balance_command_resolves_cli_network_over_config_and_default() {
+        let matches = IdentityPlugin
+            .command()
+            .try_get_matches_from(["identity", "balance", "alice", "--network", "futurenet"])
+            .unwrap();
+        let (_, args) = matches.subcommand().unwrap();
+        assert_eq!(args.get_one::<String>("network").map(String::as_str), Some("futurenet"));
+        assert_eq!(
+            resolve_balance_network_name(Some("futurenet"), Some("testnet"), Some("mainnet")),
+            "futurenet"
+        );
+        assert_eq!(
+            resolve_balance_network_name(None, Some("testnet"), Some("mainnet")),
+            "testnet"
+        );
+        assert_eq!(
+            resolve_balance_network_name(None, None, Some("mainnet")),
+            "mainnet"
+        );
+        assert_eq!(resolve_balance_network_name(None, None, None), "testnet");
+    }
+
+    #[test]
+    fn balance_subcommand_refuses_offline() {
+        use soroban_forge_core::ForgeContext;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ForgeContext::with_options(
+            dir.path().to_path_buf(),
+            0,
+            false,
+            false,
+            false,
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let matches = IdentityPlugin
+            .command()
+            .try_get_matches_from(["identity", "balance", "alice", "--network", "testnet"])
+            .unwrap();
+
+        let error = IdentityPlugin.run(&matches, &ctx).unwrap_err().to_string();
+        assert!(error.contains("offline"), "expected offline refusal, got: {error}");
     }
 
     #[test]
