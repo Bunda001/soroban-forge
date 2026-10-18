@@ -6,7 +6,15 @@ use soroban_sdk::{Address, Env};
 /// What `setup` mints to each of Alice and Bob, so they can deposit.
 const USER_FUNDS: i128 = 10_000_000_000;
 
-fn setup(env: &Env) -> (StakingContractClient<'_>, TokenClient<'_>, Address, Address, Address) {
+fn setup(
+    env: &Env,
+) -> (
+    StakingContractClient<'_>,
+    TokenClient<'_>,
+    Address,
+    Address,
+    Address,
+) {
     env.mock_all_auths();
     let admin = Address::generate(env);
     let alice = Address::generate(env);
@@ -19,7 +27,7 @@ fn setup(env: &Env) -> (StakingContractClient<'_>, TokenClient<'_>, Address, Add
     sac.mint(&alice, &USER_FUNDS);
     sac.mint(&bob, &USER_FUNDS);
 
-    let staking_id = env.register(StakingContract, (admin.clone(), token_id));
+    let staking_id = env.register(StakingContract, (admin.clone(), token_id.clone(), token_id));
     let staking = StakingContractClient::new(env, &staking_id);
 
     (staking, token, admin, alice, bob)
@@ -121,7 +129,10 @@ fn distribute_with_no_stakers_rejects_without_side_effects() {
     let contract_balance = token.balance(&staking.address);
     let events = env.events().all();
 
-    assert_eq!(staking.try_distribute(&500), Err(Ok(Error::NoStakers.into())));
+    assert_eq!(
+        staking.try_distribute(&500),
+        Err(Ok(Error::NoStakers.into()))
+    );
 
     assert_eq!(env.events().all(), events);
     assert_eq!(token.balance(&admin), admin_balance);
@@ -143,7 +154,10 @@ fn distribute_after_last_withdrawal_rejects_without_side_effects() {
     let contract_balance = token.balance(&staking.address);
     let events = env.events().all();
 
-    assert_eq!(staking.try_distribute(&500), Err(Ok(Error::NoStakers.into())));
+    assert_eq!(
+        staking.try_distribute(&500),
+        Err(Ok(Error::NoStakers.into()))
+    );
 
     assert_eq!(env.events().all(), events);
     assert_eq!(token.balance(&admin), admin_balance);
@@ -307,7 +321,13 @@ fn get_pending_reward_after_claim_is_zero() {
 fn setup_with_balance(
     env: &Env,
     admin_balance: i128,
-) -> (StakingContractClient<'_>, TokenClient<'_>, Address, Address, Address) {
+) -> (
+    StakingContractClient<'_>,
+    TokenClient<'_>,
+    Address,
+    Address,
+    Address,
+) {
     env.mock_all_auths();
     let admin = Address::generate(env);
     let alice = Address::generate(env);
@@ -318,7 +338,7 @@ fn setup_with_balance(
     let sac = StellarAssetClient::new(env, &token_id);
     sac.mint(&admin, &admin_balance);
 
-    let staking_id = env.register(StakingContract, (admin.clone(), token_id));
+    let staking_id = env.register(StakingContract, (admin.clone(), token_id.clone(), token_id));
     let staking = StakingContractClient::new(env, &staking_id);
 
     (staking, token, admin, alice, bob)
@@ -414,4 +434,114 @@ fn two_distributions_near_limit_accumulate_correctly() {
     assert_eq!(claimed, two_quarters);
     // Alice's 1 minted token is still staked in the contract.
     assert_eq!(token.balance(&alice), two_quarters);
+}
+
+// ---------------------------------------------------------------------------
+// Separate stake and reward tokens
+
+fn setup_two_tokens(
+    env: &Env,
+) -> (
+    StakingContractClient<'_>,
+    TokenClient<'_>,
+    TokenClient<'_>,
+    Address,
+    Address,
+    Address,
+) {
+    env.mock_all_auths();
+    let admin = Address::generate(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+
+    let stake_id = env.register_stellar_asset_contract(admin.clone());
+    let stake_token = TokenClient::new(env, &stake_id);
+    let stake_sac = StellarAssetClient::new(env, &stake_id);
+    stake_sac.mint(&alice, &USER_FUNDS);
+    stake_sac.mint(&bob, &USER_FUNDS);
+
+    let reward_id = env.register_stellar_asset_contract(admin.clone());
+    let reward_token = TokenClient::new(env, &reward_id);
+    let reward_sac = StellarAssetClient::new(env, &reward_id);
+    reward_sac.mint(&admin, &10_000_000_000);
+
+    let staking_id = env.register(StakingContract, (admin.clone(), stake_id, reward_id));
+    let staking = StakingContractClient::new(env, &staking_id);
+
+    (staking, stake_token, reward_token, admin, alice, bob)
+}
+
+#[test]
+fn two_tokens_deposit_uses_stake_token() {
+    let env = Env::default();
+    let (staking, stake_token, reward_token, _admin, alice, _bob) = setup_two_tokens(&env);
+
+    staking.deposit(&alice, &1000);
+    assert_eq!(staking.get_staked(&alice), 1000);
+    assert_eq!(stake_token.balance(&alice), USER_FUNDS - 1000);
+    assert_eq!(stake_token.balance(&staking.address), 1000);
+    assert_eq!(reward_token.balance(&alice), 0);
+}
+
+#[test]
+fn two_tokens_distribute_and_claim_use_reward_token() {
+    let env = Env::default();
+    let (staking, stake_token, reward_token, _admin, alice, _bob) = setup_two_tokens(&env);
+
+    staking.deposit(&alice, &1000);
+    staking.distribute(&500);
+
+    assert_eq!(staking.claim(&alice), 500);
+    assert_eq!(reward_token.balance(&alice), 500);
+    assert_eq!(stake_token.balance(&alice), USER_FUNDS - 1000);
+    assert_eq!(staking.get_staked(&alice), 1000);
+}
+
+#[test]
+fn two_tokens_withdraw_returns_stake_token() {
+    let env = Env::default();
+    let (staking, stake_token, reward_token, _admin, alice, _bob) = setup_two_tokens(&env);
+
+    staking.deposit(&alice, &1000);
+    staking.distribute(&500);
+    staking.withdraw(&alice, &400);
+
+    // The internal claim paid 500 reward tokens; withdraw returned 400 stake tokens.
+    assert_eq!(reward_token.balance(&alice), 500);
+    assert_eq!(stake_token.balance(&alice), USER_FUNDS - 1000 + 400);
+    assert_eq!(staking.get_staked(&alice), 600);
+    assert_eq!(staking.get_total_staked(), 600);
+}
+
+#[test]
+fn two_tokens_multi_staker_proportional() {
+    let env = Env::default();
+    let (staking, _stake_token, reward_token, _admin, alice, bob) = setup_two_tokens(&env);
+
+    staking.deposit(&alice, &1000);
+    staking.deposit(&bob, &3000);
+    staking.distribute(&400);
+
+    assert_eq!(staking.claim(&alice), 100);
+    assert_eq!(staking.claim(&bob), 300);
+    assert_eq!(reward_token.balance(&alice), 100);
+    assert_eq!(reward_token.balance(&bob), 300);
+}
+
+#[test]
+fn two_tokens_getters_return_configured_tokens() {
+    let env = Env::default();
+    let (staking, stake_token, reward_token, _admin, _alice, _bob) = setup_two_tokens(&env);
+
+    assert_eq!(staking.get_stake_token(), stake_token.address);
+    assert_eq!(staking.get_reward_token(), reward_token.address);
+}
+
+#[test]
+fn same_token_getters_return_same_token() {
+    let env = Env::default();
+    let (staking, token, _admin, _alice, _bob) = setup(&env);
+
+    assert_eq!(staking.get_stake_token(), token.address);
+    assert_eq!(staking.get_reward_token(), token.address);
 }

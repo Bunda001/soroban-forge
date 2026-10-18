@@ -1,6 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, panic_with_error};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Env,
+};
 
 const SCALE: i128 = 1_000_000_000_000_000_000;
 
@@ -24,7 +27,8 @@ pub enum Error {
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
-    Token,
+    StakeToken,
+    RewardToken,
     AccRewardPerShare,
     TotalStaked,
     Staked(Address),
@@ -35,20 +39,32 @@ fn admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
-fn token(env: &Env) -> Address {
-    env.storage().instance().get(&DataKey::Token).unwrap()
+fn stake_token(env: &Env) -> Address {
+    env.storage().instance().get(&DataKey::StakeToken).unwrap()
+}
+
+fn reward_token(env: &Env) -> Address {
+    env.storage().instance().get(&DataKey::RewardToken).unwrap()
 }
 
 fn acc_per_share(env: &Env) -> i128 {
-    env.storage().instance().get(&DataKey::AccRewardPerShare).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&DataKey::AccRewardPerShare)
+        .unwrap_or(0)
 }
 
 fn set_acc_per_share(env: &Env, val: i128) {
-    env.storage().instance().set(&DataKey::AccRewardPerShare, &val);
+    env.storage()
+        .instance()
+        .set(&DataKey::AccRewardPerShare, &val);
 }
 
 fn total_staked(env: &Env) -> i128 {
-    env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalStaked)
+        .unwrap_or(0)
 }
 
 fn set_total_staked(env: &Env, val: i128) {
@@ -56,19 +72,29 @@ fn set_total_staked(env: &Env, val: i128) {
 }
 
 fn read_staked(env: &Env, user: &Address) -> i128 {
-    env.storage().persistent().get(&DataKey::Staked(user.clone())).unwrap_or(0)
+    env.storage()
+        .persistent()
+        .get(&DataKey::Staked(user.clone()))
+        .unwrap_or(0)
 }
 
 fn write_staked(env: &Env, user: &Address, val: i128) {
-    env.storage().persistent().set(&DataKey::Staked(user.clone()), &val);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Staked(user.clone()), &val);
 }
 
 fn reward_debt(env: &Env, user: &Address) -> i128 {
-    env.storage().persistent().get(&DataKey::RewardDebt(user.clone())).unwrap_or(0)
+    env.storage()
+        .persistent()
+        .get(&DataKey::RewardDebt(user.clone()))
+        .unwrap_or(0)
 }
 
 fn set_reward_debt(env: &Env, user: &Address, val: i128) {
-    env.storage().persistent().set(&DataKey::RewardDebt(user.clone()), &val);
+    env.storage()
+        .persistent()
+        .set(&DataKey::RewardDebt(user.clone()), &val);
 }
 
 fn pending(env: &Env, user: &Address) -> i128 {
@@ -83,7 +109,11 @@ fn pending(env: &Env, user: &Address) -> i128 {
         .checked_mul(acc)
         .unwrap_or_else(|| panic_with_error!(env, Error::Overflow))
         / SCALE;
-    if raw > debt { raw - debt } else { 0 }
+    if raw > debt {
+        raw - debt
+    } else {
+        0
+    }
 }
 
 fn _claim(env: &Env, user: &Address) -> i128 {
@@ -95,7 +125,7 @@ fn _claim(env: &Env, user: &Address) -> i128 {
             .unwrap_or_else(|| panic_with_error!(env, Error::Overflow))
             / SCALE;
         set_reward_debt(env, user, new_debt);
-        let tok = token(env);
+        let tok = reward_token(env);
         soroban_sdk::token::Client::new(env, &tok).transfer(
             &env.current_contract_address(),
             user,
@@ -110,9 +140,17 @@ pub struct StakingContract;
 
 #[contractimpl]
 impl StakingContract {
-    pub fn __constructor(env: Env, admin: Address, token: Address) {
+    /// `stake_token` is what users deposit; `reward_token` is what
+    /// `distribute` pays out. Pass the same address twice for the classic
+    /// single-token setup.
+    pub fn __constructor(env: Env, admin: Address, stake_token: Address, reward_token: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::StakeToken, &stake_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardToken, &reward_token);
     }
 
     pub fn deposit(env: Env, user: Address, amount: i128) {
@@ -121,7 +159,7 @@ impl StakingContract {
             panic_with_error!(&env, Error::InvalidAmount);
         }
         _claim(&env, &user);
-        let tok = token(&env);
+        let tok = stake_token(&env);
         soroban_sdk::token::Client::new(&env, &tok).transfer(
             &user,
             &env.current_contract_address(),
@@ -135,7 +173,8 @@ impl StakingContract {
             / SCALE;
         set_reward_debt(&env, &user, new_debt);
         set_total_staked(&env, total_staked(&env) + amount);
-        env.events().publish((symbol_short!("deposit"), user), amount);
+        env.events()
+            .publish((symbol_short!("deposit"), user), amount);
     }
 
     pub fn withdraw(env: Env, user: Address, amount: i128) {
@@ -156,13 +195,14 @@ impl StakingContract {
             / SCALE;
         set_reward_debt(&env, &user, new_debt);
         set_total_staked(&env, total_staked(&env) - amount);
-        let tok = token(&env);
+        let tok = stake_token(&env);
         soroban_sdk::token::Client::new(&env, &tok).transfer(
             &env.current_contract_address(),
             &user,
             &amount,
         );
-        env.events().publish((symbol_short!("withdraw"), user), amount);
+        env.events()
+            .publish((symbol_short!("withdraw"), user), amount);
     }
 
     pub fn distribute(env: Env, amount: i128) {
@@ -179,7 +219,7 @@ impl StakingContract {
             .checked_mul(SCALE)
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
             / total;
-        let tok = token(&env);
+        let tok = reward_token(&env);
         soroban_sdk::token::Client::new(&env, &tok).transfer(
             &admin(&env),
             &env.current_contract_address(),
@@ -213,6 +253,14 @@ impl StakingContract {
 
     pub fn get_pending_reward(env: Env, user: Address) -> i128 {
         pending(&env, &user)
+    }
+
+    pub fn get_stake_token(env: Env) -> Address {
+        stake_token(&env)
+    }
+
+    pub fn get_reward_token(env: Env) -> Address {
+        reward_token(&env)
     }
 }
 
