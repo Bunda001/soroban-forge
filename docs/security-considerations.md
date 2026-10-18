@@ -33,8 +33,8 @@ most common way to reintroduce a bug the template avoided:
   `if caller != stored_oracle` branch rather than the framework's own
   authorization machinery — read it carefully before copying the shape
   elsewhere.
-- **Deliberately unauthenticated**: `prediction-market`'s `claim` and
-  `flash-loan`'s repayment path require no authorization at all, by design —
+- **Deliberately unauthenticated**: `prediction-market`'s `claim` and `refund`
+  and `flash-loan`'s repayment path require no authorization at all, by design —
   funds can only go to their rightful owner, so nothing is gained by
   triggering someone else's payout or by anyone but the borrower repaying.
   This is safe *because* of how each contract routes funds, not a general
@@ -137,12 +137,13 @@ single configured address:
   compromised oracle address controls every value this contract derives from
   it.
 - `prediction-market`'s `resolve` is gated on a single oracle address fixed
-  at deploy time and can only be called once — there is no dispute window
-  and no fallback if that address never calls `resolve` or resolves
-  incorrectly. The market also never enforces a staking deadline (stakes are
-  accepted until the moment of resolution) and pays out nothing if the
-  resolved outcome has no backers; both are documented as deliberate,
-  narrow tradeoffs in the template's own README, not bugs.
+  at deploy time and can only be called once, between the betting close time
+  and a resolution deadline, both fixed at deploy time — there is no dispute
+  window and no recourse if that address resolves incorrectly. Staking closes
+  before the outcome can be reported. If the oracle never resolves, the
+  deadline is the fallback: from then on `resolve` is closed and `refund`
+  returns each participant's stakes, so funds are not locked forever. If the
+  resolved outcome has no backers, `claim` refunds each participant's stake.
 
 Neither template should be pointed at an oracle address you do not fully
 trust, and neither implements the multi-oracle aggregation or staleness

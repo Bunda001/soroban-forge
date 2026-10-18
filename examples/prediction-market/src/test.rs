@@ -10,6 +10,12 @@ const NO: bool = false;
 /// this is always in the future when the market is deployed.
 const CLOSE_TIME: u64 = 1_000;
 
+/// How long the oracle has to resolve after betting closes.
+const RESOLUTION_WINDOW: u64 = 100_000;
+
+/// The resolution deadline used by `setup`.
+const DEADLINE: u64 = CLOSE_TIME + RESOLUTION_WINDOW;
+
 /// Generated `try_*` methods report contract errors as `soroban_sdk::Error`,
 /// so convert ours before comparing.
 fn err(e: Error) -> soroban_sdk::Error {
@@ -28,6 +34,10 @@ fn setup(env: &Env) -> Setup<'_> {
 }
 
 fn setup_with_close_time(env: &Env, close_time: u64) -> Setup<'_> {
+    setup_with_times(env, close_time, close_time + RESOLUTION_WINDOW)
+}
+
+fn setup_with_times(env: &Env, close_time: u64, deadline: u64) -> Setup<'_> {
     env.mock_all_auths();
 
     let oracle = Address::generate(env);
@@ -37,7 +47,7 @@ fn setup_with_close_time(env: &Env, close_time: u64) -> Setup<'_> {
 
     let market_id = env.register(
         PredictionMarketContract,
-        (oracle.clone(), token_address.clone(), close_time),
+        (oracle.clone(), token_address.clone(), close_time, deadline),
     );
 
     Setup {
@@ -77,6 +87,7 @@ fn constructor_stores_oracle_token_and_close_time() {
     assert_eq!(s.market.get_oracle(), s.oracle);
     assert_eq!(s.market.get_token(), s.token_address);
     assert_eq!(s.market.get_close_time(), CLOSE_TIME);
+    assert_eq!(s.market.get_deadline(), DEADLINE);
     assert_eq!(s.market.get_outcome(), None);
 }
 
@@ -461,4 +472,169 @@ fn non_participant_gets_nothing_from_a_refund_market() {
         Err(Ok(err(Error::NothingToClaim)))
     );
     assert_eq!(s.token.balance(&s.market.address), 600);
+}
+
+// --- resolution deadline and refunds for unresolved markets ---
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn constructor_rejects_deadline_equal_to_close_time() {
+    let env = Env::default();
+    setup_with_times(&env, CLOSE_TIME, CLOSE_TIME);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn constructor_rejects_deadline_before_close_time() {
+    let env = Env::default();
+    setup_with_times(&env, CLOSE_TIME, CLOSE_TIME - 1);
+}
+
+#[test]
+fn resolve_just_before_the_deadline_still_works() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    set_time(&env, DEADLINE - 1);
+    s.market.resolve(&s.oracle, &YES);
+    assert_eq!(s.market.get_outcome(), Some(YES));
+}
+
+#[test]
+fn resolve_at_or_after_the_deadline_is_rejected() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    set_time(&env, DEADLINE);
+    assert_eq!(
+        s.market.try_resolve(&s.oracle, &YES),
+        Err(Ok(err(Error::DeadlinePassed)))
+    );
+    set_time(&env, DEADLINE + 3_600);
+    assert_eq!(
+        s.market.try_resolve(&s.oracle, &YES),
+        Err(Ok(err(Error::DeadlinePassed)))
+    );
+    assert_eq!(s.market.get_outcome(), None);
+}
+
+#[test]
+fn unresolved_market_refunds_every_participant_after_the_deadline() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, YES, 600);
+    let bob = staker(&env, &s, NO, 400);
+
+    set_time(&env, DEADLINE);
+    assert_eq!(s.market.refund(&alice), 600);
+    assert_eq!(s.market.refund(&bob), 400);
+
+    assert_eq!(s.token.balance(&alice), 600);
+    assert_eq!(s.token.balance(&bob), 400);
+    assert_eq!(s.token.balance(&s.market.address), 0);
+    assert!(s.market.has_claimed(&alice));
+}
+
+#[test]
+fn refund_returns_stakes_on_both_sides() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let carol = Address::generate(&env);
+    s.token_admin.mint(&carol, &1_000);
+    s.market.stake(&carol, &YES, &300);
+    s.market.stake(&carol, &NO, &700);
+
+    set_time(&env, DEADLINE + 10_000);
+    assert_eq!(s.market.refund(&carol), 1_000);
+    assert_eq!(s.token.balance(&carol), 1_000);
+}
+
+#[test]
+fn refund_before_the_deadline_is_rejected() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, YES, 600);
+    assert_eq!(
+        s.market.try_refund(&alice),
+        Err(Ok(err(Error::DeadlineNotReached)))
+    );
+    set_time(&env, DEADLINE - 1);
+    assert_eq!(
+        s.market.try_refund(&alice),
+        Err(Ok(err(Error::DeadlineNotReached)))
+    );
+    assert_eq!(s.token.balance(&s.market.address), 600);
+}
+
+#[test]
+fn double_refund_is_rejected() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, YES, 600);
+    set_time(&env, DEADLINE);
+    s.market.refund(&alice);
+    assert_eq!(
+        s.market.try_refund(&alice),
+        Err(Ok(err(Error::AlreadyClaimed)))
+    );
+    assert_eq!(s.token.balance(&alice), 600);
+}
+
+#[test]
+fn refund_without_a_stake_is_rejected() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    staker(&env, &s, YES, 600);
+    set_time(&env, DEADLINE);
+    let outsider = Address::generate(&env);
+    assert_eq!(
+        s.market.try_refund(&outsider),
+        Err(Ok(err(Error::NothingToClaim)))
+    );
+}
+
+#[test]
+fn refund_is_rejected_once_the_market_is_resolved() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, YES, 600);
+    staker(&env, &s, NO, 400);
+    close_betting(&env);
+    s.market.resolve(&s.oracle, &NO);
+
+    set_time(&env, DEADLINE);
+    assert_eq!(
+        s.market.try_refund(&alice),
+        Err(Ok(err(Error::AlreadyResolved)))
+    );
+}
+
+#[test]
+fn claim_on_an_expired_unresolved_market_is_rejected() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, YES, 600);
+    set_time(&env, DEADLINE);
+    assert_eq!(s.market.try_claim(&alice), Err(Ok(err(Error::NotResolved))));
+}
+
+#[test]
+fn winners_can_still_claim_after_the_deadline() {
+    let env = Env::default();
+    let s = setup(&env);
+
+    let alice = staker(&env, &s, YES, 600);
+    staker(&env, &s, NO, 400);
+    close_betting(&env);
+    s.market.resolve(&s.oracle, &YES);
+
+    set_time(&env, DEADLINE + 10_000);
+    assert_eq!(s.market.claim(&alice), 1_000);
 }
