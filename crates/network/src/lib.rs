@@ -415,6 +415,17 @@ pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
     probe_rpc_endpoint(url, None, timeout)
 }
 
+/// Probe `url` and verify that a Soroban RPC `passphrase` matches
+/// `expected_passphrase`. A mismatch is reported distinctly via
+/// [`Reachability::PassphraseMismatch`].
+pub fn probe_endpoint_with_passphrase(
+    url: &str,
+    expected_passphrase: &str,
+    timeout: Duration,
+) -> Reachability {
+    probe_rpc_endpoint(url, Some(expected_passphrase), timeout)
+}
+
 /// Probe a Soroban RPC endpoint over HTTP JSON-RPC (`getHealth` / `getNetwork`)
 /// and check health and optional network passphrase.
 pub fn probe_rpc_endpoint(
@@ -563,9 +574,11 @@ pub fn probe_rpc_endpoint(
 pub fn probe_networks(store: &NetworkStore, timeout: Duration) -> BTreeMap<String, Reachability> {
     let handles: Vec<_> = listed_names(store)
         .into_iter()
-        .filter_map(|name| resolve_network(store, &name).map(|n| (name, n.rpc_url)))
-        .map(|(name, url)| {
-            let handle = std::thread::spawn(move || probe_endpoint(&url, timeout));
+        .filter_map(|name| resolve_network(store, &name).map(|n| (name, n)))
+        .map(|(name, net)| {
+            let handle = std::thread::spawn(move || {
+                probe_endpoint_with_passphrase(&net.rpc_url, &net.network_passphrase, timeout)
+            });
             (name, handle)
         })
         .collect();
@@ -607,6 +620,22 @@ pub fn unreachable_warning(name: &str, rpc_url: &str, reason: &str) -> String {
     out
 }
 
+/// Warning printed when the endpoint responded to `getNetwork` with a
+/// different passphrase than configured.
+pub fn passphrase_mismatch_warning(
+    name: &str,
+    rpc_url: &str,
+    expected: &str,
+    actual: &str,
+) -> String {
+    let mut out = format!(
+        "warning: `{name}` endpoint {rpc_url} reported passphrase mismatch (expected \"{expected}\", got \"{actual}\")\n"
+    );
+    out.push_str("  the network was saved, but deploy/invoke/verify against it will fail\n");
+    out.push_str("  hint: verify --passphrase or --rpc-url, or re-probe with `network list --check`");
+    out
+}
+
 /// Probe `rpc_url` and warn on stderr when it does not respond, returning the
 /// result so `--json` output can carry it.  Returns `None` when the check was
 /// skipped (see [`should_check_endpoint`]).
@@ -625,10 +654,21 @@ pub fn check_endpoint_and_warn(
     }
     let timeout = ctx.timeout().unwrap_or(DEFAULT_CHECK_TIMEOUT);
     let result = probe_endpoint(rpc_url, timeout);
-    if let Reachability::Unreachable(reason) = &result {
-        if !ctx.json {
-            eprintln!("{}", unreachable_warning(name, rpc_url, reason));
+    match &result {
+        Reachability::Unreachable(reason) => {
+            if !ctx.json {
+                eprintln!("{}", unreachable_warning(name, rpc_url, reason));
+            }
         }
+        Reachability::PassphraseMismatch { expected, actual } => {
+            if !ctx.json {
+                eprintln!(
+                    "{}",
+                    passphrase_mismatch_warning(name, rpc_url, expected, actual)
+                );
+            }
+        }
+        Reachability::Reachable { .. } => {}
     }
     Some(result)
 }
@@ -1597,11 +1637,29 @@ mod tests {
 
     // ---- network list --check (issue #411) ----
 
-    /// A live local endpoint: the listener accepts connections for the
-    /// lifetime of the returned handle.
+    /// A live local endpoint: the listener accepts connections and replies
+    /// with a healthy Soroban RPC `getHealth` payload.
     fn reachable_endpoint() -> (std::net::TcpListener, String) {
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let server = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            for stream in server.incoming().flatten() {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
         (listener, format!("http://127.0.0.1:{port}/soroban/rpc"))
     }
 

@@ -10,7 +10,7 @@ struct Tok<'a> {
     admin: StellarAssetClient<'a>,
 }
 
-fn make_token(env: &Env) -> Tok<'_> {
+fn make_token(env: &Env) -> Tok<_> {
     let issuer = Address::generate(env);
     let sac = env.register_stellar_asset_contract_v2(issuer);
     let address = sac.address();
@@ -21,7 +21,7 @@ fn make_token(env: &Env) -> Tok<'_> {
     }
 }
 
-#[allow(dead_code)]
+#[allot(dead_code)]
 struct TestContext<'a> {
     contract: EnglishAuctionContractClient<'a>,
     asset_token: Tok<'a>,
@@ -35,7 +35,7 @@ struct TestContext<'a> {
     asset_amount: i128,
 }
 
-fn setup(env: &Env) -> TestContext<'_> {
+fn setup(env: &Env) -> TestContext<_> {
     env.mock_all_auths();
 
     let start_ts = 1_000_000_u64;
@@ -105,7 +105,7 @@ fn test_place_bid_at_reserve_price() {
 
 #[test]
 fn test_place_multiple_bids() {
-    let env = Env::default();
+    let env = Env:default();
     let ctx = setup(&env);
 
     ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);
@@ -122,9 +122,69 @@ fn test_place_multiple_bids() {
 #[test]
 #[should_panic(expected = "bid is too low")]
 fn test_bid_below_reserve() {
-    let env = Env::default();
+    let env = Env:default();
     let ctx = setup(&env);
     ctx.contract.place_bid(&ctx.bidder1, &(ctx.reserve_price - 1));
+}
+
+#[test]
+#[should_panic(expected = "bid is too low")]
+fn test_bid_below_min_increment() {
+    let env = Env:default();
+    let ctx = setup(&env);
+    // 10% = 1000 bps minimum increment
+    ctx.contract.set_min_increment(&1000);
+    ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);
+    // One stroop above is not enough with 1000 bps on 500 = 50 min increment
+    ctx.contract
+        .place_bid(&ctx.bidder2, &(ctx.reserve_price + 1));
+}
+
+#[test]
+fn test_bid_meets_min_increment() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.contract.set_min_increment(&1000);
+    ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);
+    // 500 + 10% = 550
+    ctx.contract
+        .place_bid(&ctx.bidder2, &(ctx.reserve_price + 50));
+    let (bidder, bid) = ctx.contract.get_highest_bid();
+    assert_eq!(bidder, Some(ctx.bidder2.clone()));
+    assert_eq!(bid, ctx.reserve_price + 50);
+}
+
+#[test]
+fn test_extends_near_end() {
+    let env = Env:default();
+    let ctx = setup(&env);
+    // Extend by 500s if bid within 100s (last ledger) of end
+    ctx.contract.set_extension(&100, &500);
+    ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);
+
+    let original_end = ctx.contract.get_end_time();
+    // Jump to within the extension window
+    env.ledger().with_mut(|li| li.timestamp = original_end - 50);
+    ctx.contract
+        .place_bid(&ctx.bidder2, &(ctx.reserve_price + 100));
+
+    assert_eq!(ctx.contract.get_end_time(), original_end + 500);
+}
+
+#[test]
+fn test_does_not_extend_far_from_end() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.contract.set_extension(&100, &500);
+    ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);
+
+    let original_end = ctx.contract.get_end_time();
+    // Bid well before the window
+    env.ledger().with_mut(|li| li.timestamp = original_end - 500);
+    ctx.contract
+        .place_bid(&ctx.bidder2, &(ctx.reserve_price + 100));
+
+    assert_eq!(ctx.contract.get_end_time(), original_end);
 }
 
 #[test]
@@ -147,7 +207,7 @@ fn test_settle_after_auction_ends() {
 
 #[test]
 fn test_cancel_auction() {
-    let env = Env::default();
+    let env = Env:default();
     let ctx = setup(&env);
 
     ctx.contract.place_bid(&ctx.bidder1, &ctx.reserve_price);

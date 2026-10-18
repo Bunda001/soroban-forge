@@ -1,6 +1,8 @@
 # english-auction
 
-English-auction contract template scaffold for iterative bids, minimum increments, and seller settlement flow.
+English-auction contract template for iterative bids, minimum increments, and seller settlement flow.
+
+Bids must exceed the current highest bid by a minimum increment configured in basis points (1 bps = 0.01%). A bid that lands within a configurable window of the end time extends the auction by the configured extension, preventing last-ledger sniping.
 
 ## Security
 

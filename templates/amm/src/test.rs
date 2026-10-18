@@ -171,3 +171,15 @@ fn swap_past_deadline_panics() {
     pool.swap_with_deadline(&trader, &false, &100, &1_000, &100);
 }
 
+#[test]
+#[should_panic]
+fn constructor_rejects_identical_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token_a = make_token(&env);
+    env.register(
+        LiquidityPool,
+        (token_a.address.clone(), token_a.address.clone()),
+    );
+}
+

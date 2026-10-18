@@ -24,6 +24,8 @@ pub enum DataKey {
     End,
     TotalAmount,
     Claimed,
+    Funded,
+    Cancelled,
 }
 
 #[contract]
@@ -77,20 +79,83 @@ impl StreamingContract {
             .instance()
             .set(&DataKey::TotalAmount, &total_amount);
         env.storage().instance().set(&DataKey::Claimed, &0_i128);
+        env.storage().instance().set(&DataKey::Funded, &false);
+        env.storage().instance().set(&DataKey::Cancelled, &false);
     }
 
     /// Deposit the full stream amount into this contract.
     ///
-    /// Must be called by the `sender` after `initialize`.
+    /// Must be called once by the `sender` after `initialize`.
     pub fn fund(env: Env) {
         let sender: Address = env.storage().instance().get(&DataKey::Sender).unwrap();
         sender.require_auth();
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Funded)
+            .unwrap_or(false)
+        {
+            panic!("already funded");
+        }
+        env.storage().instance().set(&DataKey::Funded, &true);
 
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let total_amount: i128 = env.storage().instance().get(&DataKey::TotalAmount).unwrap();
 
         let client = token::Client::new(&env, &token);
         client.transfer(&sender, &env.current_contract_address(), &total_amount);
+    }
+
+    /// Cancel the stream as the sender, settling any unclaimed streamed tokens
+    /// to the recipient and refunding the unstreamed balance to the sender.
+    pub fn cancel(env: Env) -> (i128, i128) {
+        let sender: Address = env.storage().instance().get(&DataKey::Sender).unwrap();
+        sender.require_auth();
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Cancelled)
+            .unwrap_or(false)
+        {
+            panic!("already cancelled");
+        }
+
+        let streamed = Self::get_streamed_amount(env.clone());
+        let claimed: i128 = env.storage().instance().get(&DataKey::Claimed).unwrap();
+        let total_amount: i128 = env.storage().instance().get(&DataKey::TotalAmount).unwrap();
+        let recipient_due = streamed - claimed;
+        let sender_refund = total_amount - streamed;
+
+        env.storage().instance().set(&DataKey::Cancelled, &true);
+        env.storage().instance().set(&DataKey::Claimed, &streamed);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAmount, &streamed);
+        env.storage()
+            .instance()
+            .set(&DataKey::End, &env.ledger().timestamp());
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Funded)
+            .unwrap_or(false)
+        {
+            let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            let recipient: Address = env.storage().instance().get(&DataKey::Recipient).unwrap();
+            let client = token::Client::new(&env, &token);
+            let contract_addr = env.current_contract_address();
+            if recipient_due > 0 {
+                client.transfer(&contract_addr, &recipient, &recipient_due);
+            }
+            if sender_refund > 0 {
+                client.transfer(&contract_addr, &sender, &sender_refund);
+            }
+        }
+
+        (recipient_due, sender_refund)
     }
 
     /// Return the amount of tokens streamed so far according to elapsed time.

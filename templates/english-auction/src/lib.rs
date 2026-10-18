@@ -32,6 +32,10 @@ pub enum DataKey {
     HighestBid,
     PreviousBidder,
     PreviousBid,
+    /// Minimum bid increment in basis points (1 bps = 0.01%).
+    MinIncrementBps,
+    /// Window before auction end (seconds) within which a bid extends the end.
+    ExtensionWindow,
     Refund(Address),
 }
 #[contract]
@@ -40,12 +44,15 @@ pub struct EnglishAuctionContract;
 impl EnglishAuctionContract {
     /// Initialize the English auction.
     ///
-    /// * `seller` â€” address selling the asset
-    /// * `asset_token` â€” contract address of the SEP-41 token being sold
-    /// * `payment_token` â€” contract address of the SEP-41 token used for bidding
-    /// * `asset_amount` â€” quantity of asset tokens offered for sale
-    /// * `reserve_price` â€” minimum starting bid in payment tokens
-    /// * `duration_seconds` â€” duration of the auction in seconds
+    /// * `seller` — address selling the asset
+    /// * `asset_token` — contract address of the SEP-41 token being sold
+    /// * `payment_token` — contract address of the SEP-41 token used for bidding
+    /// * `asset_amount` — quantity of asset tokens offered for sale
+    /// * `reserve_price` — minimum starting bid in payment tokens
+    /// * `duration_seconds` — duration of the auction in seconds
+    /// * `min_increment_bps` — minimum bid increment in basis points
+    /// * `extension_window_seconds` — anti-sniping window; bids within this
+    ///   window of the end extend the auction by `extension_window_seconds`
     pub fn initialize(
         env: Env,
         seller: Address,
@@ -54,6 +61,8 @@ impl EnglishAuctionContract {
         asset_amount: i128,
         reserve_price: i128,
         duration_seconds: u64,
+        min_increment_bps: u32,
+        extension_window_seconds: u64,
     ) {
         seller.require_auth();
         if env.storage().instance().has(&DataKey::Seller) {
@@ -68,6 +77,10 @@ impl EnglishAuctionContract {
         if duration_seconds == 0 {
             panic!("duration must be positive");
         }
+        if min_increment_bps > 10_000 {
+            panic!("min increment bps too large");
+        }
+
         let now = env.ledger().timestamp();
         env.storage().instance().set(&DataKey::Seller, &seller);
         env.storage().instance().set(&DataKey::AssetToken, &asset_token);
@@ -76,6 +89,8 @@ impl EnglishAuctionContract {
         env.storage().instance().set(&DataKey::ReservePrice, &reserve_price);
         env.storage().instance().set(&DataKey::StartTime, &now);
         env.storage().instance().set(&DataKey::Duration, &duration_seconds);
+        env.storage().instance().set(&DataKey::MinIncrementBps, &min_increment_bps);
+        env.storage().instance().set(&DataKey::ExtensionWindow, &extension_window_seconds);
         env.storage().instance().set(&DataKey::State, &AuctionState::Pending);
     }
     /// Deposit the asset tokens into the auction contract to open bidding.
@@ -123,10 +138,22 @@ impl EnglishAuctionContract {
             .instance()
             .get(&DataKey::HighestBid)
             .unwrap_or(0);
+
+        let min_increment_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinIncrementBps)
+            .unwrap_or(0);
+
         let min_required = if highest_bid == 0 {
             reserve_price
         } else {
-            highest_bid + 1
+            let increment = highest_bid
+                .checked_mul(min_increment_bps as i128)
+                .expect("increment overflow")
+                / 10_000;
+            // Always require at least one unit more than the current bid.
+            highest_bid + increment.max(1)
         };
         if bid_amount < min_required {
             panic!("bid is too low");
@@ -143,6 +170,20 @@ impl EnglishAuctionContract {
         env.storage()
             .instance()
             .set(&DataKey::HighestBid, &bid_amount);
+
+        let extension_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExtensionWindow)
+            .unwrap_or(0);
+
+        if extension_window > 0 && end_time - now <= extension_window {
+            let new_end_time = end_time + extension_window;
+            let new_duration = new_end_time - start_time;
+            env.storage()
+                .instance()
+                .set(&DataKey::Duration, &new_duration);
+        }
     }
     /// Close the auction and settle with the highest bidder.
     ///
@@ -237,6 +278,21 @@ impl EnglishAuctionContract {
             .instance()
             .get(&DataKey::State)
             .unwrap_or(AuctionState::Pending)
+    }
+
+    /// Get the current auction end time (start + duration).
+    pub fn get_end_time(env: Env) -> u64 {
+        let start_time: u64 = env.storage().instance().get(&DataKey::StartTime).unwrap();
+        let duration: u64 = env.storage().instance().get(&DataKey::Duration).unwrap();
+        start_time + duration
+    }
+
+    /// Get the minimum bid increment in basis points.
+    pub fn get_min_increment_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinIncrementBps)
+            .unwrap_or(0)
     }
 
     /// Withdraw any available refund for the caller.

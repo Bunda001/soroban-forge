@@ -63,6 +63,8 @@ fn setup(env: &Env) -> TestContext<'_> {
         &asset_amount,
         &reserve_price,
         &duration,
+        &0,
+        &0,
     );
 
     // Mint tokens
@@ -247,6 +249,8 @@ fn test_refund_fails_does_not_block_new_bid() {
         &asset_amount,
         &reserve_price,
         &duration,
+        &0,
+        &0,
     );
 
     // Mint tokens

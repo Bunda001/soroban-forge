@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `prediction-market` template: the constructor takes a resolution `deadline`
+  after `close_time` (`DeadlineBeforeClose` otherwise). `resolve` fails with
+  `DeadlinePassed` from the deadline on, and a market that was never resolved
+  lets every participant `refund` their stakes, so an oracle that never
+  reports no longer locks funds forever. Deployments now pass
+  `--close_time <UNIX_SECONDS> --deadline <UNIX_SECONDS>` (#582)
 - `soroban-forge optimize --all` optimizes every contract crate in a
   workspace in one invocation, reporting one result per contract (an array
   under `--json`) (#412)

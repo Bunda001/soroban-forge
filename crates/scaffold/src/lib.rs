@@ -702,6 +702,7 @@ pub fn generate_workspace(
 /// # Errors
 ///
 /// Returns a descriptive [`ForgeError`] when:
+/// - the source is not an allowed remote URL or SSH shorthand (`Other`)
 /// - `git` is not on `PATH` (`ToolMissing`)
 /// - the network is unavailable or the URL is unreachable (`Other` with a hint
 ///   to check connectivity)
@@ -723,6 +724,24 @@ pub fn generate_from_url_with(
     force: bool,
     resolve: &mut dyn FnMut(Option<TemplateManifest>) -> Result<Vars>,
 ) -> Result<()> {
+    generate_from_url_with_git(url, dest, vars, force, resolve, &mut |url, clone_dest| {
+        std::process::Command::new("git")
+            .args(["clone", "--depth", "1", "--", url])
+            .arg(clone_dest)
+            .output()
+    })
+}
+
+fn generate_from_url_with_git(
+    url: &str,
+    dest: &Path,
+    vars: &Vars,
+    force: bool,
+    resolve: &mut dyn FnMut(Option<TemplateManifest>) -> Result<Vars>,
+    run_git_clone: &mut dyn FnMut(&str, &Path) -> std::io::Result<std::process::Output>,
+) -> Result<()> {
+    validate_remote_url(url)?;
+
     if dest.exists() && !force {
         return Err(ForgeError::AlreadyExists(dest.to_path_buf()));
     }
@@ -735,19 +754,15 @@ pub fn generate_from_url_with(
 
     log::debug!("cloning `{url}` into {}", clone_dest.display());
 
-    let output = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", "--", url])
-        .arg(&clone_dest)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ForgeError::ToolMissing(
-                    "git — install git to use --from with remote templates".into(),
-                )
-            } else {
-                ForgeError::io("running `git clone`")(e)
-            }
-        })?;
+    let output = run_git_clone(url, &clone_dest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ForgeError::ToolMissing(
+                "git — install git to use --from with remote templates".into(),
+            )
+        } else {
+            ForgeError::io("running `git clone`")(e)
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -793,6 +808,30 @@ pub fn generate_from_url_with(
     write_forge_toml(dest, &vars)?;
     Ok(())
     // `tmp` is dropped here, cleaning up the temp clone directory automatically.
+}
+
+fn validate_remote_url(url: &str) -> Result<()> {
+    let allowed_schemes = ["https://", "http://", "git://", "ssh://"];
+    let has_allowed_scheme = allowed_schemes.iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    });
+    let is_ssh_shorthand = url.split_once(':').is_some_and(|(authority, path)| {
+        !authority.contains('/')
+            && !authority.chars().any(char::is_whitespace)
+            && !path.is_empty()
+            && authority
+                .split_once('@')
+                .is_some_and(|(user, host)| !user.is_empty() && !host.is_empty())
+    });
+
+    if has_allowed_scheme || is_ssh_shorthand {
+        Ok(())
+    } else {
+        Err(ForgeError::Other(format!(
+            "unsupported template source `{url}`: expected an http://, https://, git://, or ssh:// URL, or an SSH user@host:path address"
+        )))
+    }
 }
 
 /// Walk a real filesystem directory `dir` recursively and render every file
@@ -2221,6 +2260,38 @@ default = "MYT"
             matches!(result, Err(ForgeError::AlreadyExists(_))),
             "expected AlreadyExists, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn generate_from_url_rejects_unsafe_sources_before_invoking_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = project_vars("my-project", "Test Author", "2021");
+
+        for url in [
+            "ext::sh -c 'touch pwned'",
+            "file:///tmp/template",
+            "../local-template",
+        ] {
+            let mut git_invoked = false;
+            let result = generate_from_url_with_git(
+                url,
+                &dir.path().join("my-project"),
+                &vars,
+                false,
+                &mut |_| Ok(Vars::new()),
+                &mut |_, _| {
+                    git_invoked = true;
+                    Err(std::io::Error::other("unexpected git invocation"))
+                },
+            );
+
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("unsupported template source"),
+                "expected a source validation error for `{url}`, got: {err}"
+            );
+            assert!(!git_invoked, "git runner invoked for `{url}`");
+        }
     }
 
     /// A clearly bad URL (guaranteed offline, no such host) must return a

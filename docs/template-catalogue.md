@@ -407,21 +407,24 @@ proportion to what they staked:
   losing side's stakes are what pays the winning side's profit.
 * **Oracle** — `resolve` is gated on one address fixed at deploy time.
   Nobody else can report an outcome, and it can only be reported once.
+* **Betting close and deadline** — the market has a close time and a later
+  resolution deadline (ledger timestamps) fixed at deploy time. `stake` only
+  works before the close time; `resolve` only between the close time and the
+  deadline.
+* **Refunds** — if the deadline passes and the oracle never resolved the
+  market (lost key, abandoned market), `refund` lets each participant take
+  back exactly what they staked, on both sides. Stakes are never locked
+  forever.
 * **Pull payments** — nothing is pushed on resolution. Each winner claims
   their own payout, exactly once.
 * **Rounding** — payouts are floor-divided, so up to `winning_pool - 1`
   units can stay behind in the contract as dust.
 
-Two edges this template deliberately leaves open, both worth closing
-before using it for real:
+* **Empty winning side** — if the oracle resolves to a side nobody staked,
+  `claim` refunds each participant their own stake instead of locking the
+  pool.
 
-* There is no staking deadline — the market accepts stakes right up until
-  the oracle resolves it, so someone who learns the outcome early can
-  still buy in. A real market closes staking before the event settles.
-* If the oracle resolves to a side nobody staked, there are no winners and
-  the pool stays in the contract; every `claim` reports `NothingToClaim`.
-
-**Entrypoints:** `stake`, `resolve`, `claim`, `get_oracle`, `get_token`, `get_outcome`, `get_pool`, `get_total_pool`, `get_stake`, `has_claimed`
+**Entrypoints:** `stake`, `resolve`, `claim`, `refund`, `get_oracle`, `get_token`, `get_close_time`, `get_deadline`, `get_outcome`, `get_pool`, `get_total_pool`, `get_stake`, `has_claimed`
 
 **When to pick it:** a binary-outcome market settled by a single trusted oracle, paid out parimutuel-style
 
