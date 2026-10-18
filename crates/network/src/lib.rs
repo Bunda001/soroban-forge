@@ -425,10 +425,8 @@ pub fn endpoint_host_port(url: &str) -> std::result::Result<(String, u16), Strin
     Ok((host.to_string(), port))
 }
 
-/// Lightweight reachability probe: resolve the endpoint and open (then
-/// immediately drop) a TCP connection, bounded by `timeout`.  No RPC request
-/// is sent, so it is cheap and side-effect free; it answers "can this machine
-/// reach the endpoint right now", which is what `list --check` reports.
+/// Reachability probe: verify that a healthy Soroban RPC endpoint answers a
+/// `getHealth` JSON-RPC request within `timeout`.
 pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
     let (host, port) = match endpoint_host_port(url) {
         Ok(hp) => hp,
@@ -445,6 +443,7 @@ pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
     }
 
     let mut last_error = None;
+    let mut connected = false;
     for addr in addrs {
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -452,20 +451,71 @@ pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
         }
         match TcpStream::connect_timeout(&addr, remaining) {
             Ok(_) => {
-                return Reachability::Reachable {
-                    latency_ms: started.elapsed().as_millis() as u64,
-                }
+                connected = true;
+                break;
             }
             Err(e) => last_error = Some(e),
         }
     }
-    Reachability::Unreachable(match last_error {
-        Some(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            format!("timed out after {}s", timeout.as_secs_f64())
+    if !connected {
+        return Reachability::Unreachable(match last_error {
+            Some(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                format!("timed out after {}s", timeout.as_secs_f64())
+            }
+            Some(e) => e.to_string(),
+            None => format!("timed out after {}s", timeout.as_secs_f64()),
+        });
+    }
+
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Reachability::Unreachable(format!("timed out after {}s", timeout.as_secs_f64()));
+    }
+
+    let payload = r#"{"jsonrpc":"2.0","id":1,"method":"getHealth"}"#;
+    let response = ureq::post(url)
+        .timeout(remaining)
+        .set("Content-Type", "application/json")
+        .send_string(payload);
+
+    match response {
+        Ok(resp) => {
+            let body = match resp.into_string() {
+                Ok(b) => b,
+                Err(e) => return Reachability::Unreachable(format!("invalid RPC response: {e}")),
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Reachability::Unreachable(format!("non-JSON RPC response: {e}"))
+                }
+            };
+            if let Some(err_msg) = parsed
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                return Reachability::Unreachable(format!("RPC error: {err_msg}"));
+            }
+            match parsed
+                .get("result")
+                .and_then(|r| r.get("status"))
+                .and_then(|s| s.as_str())
+            {
+                Some("healthy") => Reachability::Reachable {
+                    latency_ms: started.elapsed().as_millis() as u64,
+                },
+                Some(status) => Reachability::Unreachable(format!("RPC status `{status}`")),
+                None => Reachability::Unreachable("missing health status in RPC response".into()),
+            }
         }
-        Some(e) => e.to_string(),
-        None => format!("timed out after {}s", timeout.as_secs_f64()),
-    })
+        Err(ureq::Error::Status(code, _)) => {
+            Reachability::Unreachable(format!("HTTP {code}"))
+        }
+        Err(ureq::Error::Transport(t)) => {
+            Reachability::Unreachable(t.message().unwrap_or("transport error").to_string())
+        }
+    }
 }
 
 /// Probe every listed network concurrently, so one slow endpoint does not
@@ -827,26 +877,20 @@ impl ForgePlugin for NetworkPlugin {
 
             Some(("use", sub)) => {
                 let name = sub.get_one::<String>("name").unwrap();
-                update_store(&path, |store| {
+                let rpc_url = update_store(&path, |store| {
                     // #289 — also accept built-in names that aren't in the user store
-                    let network_exists = store.networks.contains_key(name.as_str())
-                        || well_known(name.as_str()).is_some();
-                    if !network_exists {
+                    let Some(network) = resolve_network(store, name.as_str()) else {
                         return Err(ForgeError::InvalidArgument(format!(
                             "network `{name}` not found (use `soroban-forge network list` to see available networks)"
                         )));
-                    }
+                    };
 
                     store.default = Some(name.clone());
-                    Ok(())
+                    Ok(Some(network.rpc_url))
                 })?;
 
                 // #290 — persist the choice into forge.toml so deploy/invoke/verify pick it up
                 write_network_to_forge_toml(&ctx.cwd, name)?;
-
-                // The selected network always resolves here: `network_exists`
-                // above checked the store and the built-in presets.
-                let rpc_url = resolve_network(&store, name).map(|n| n.rpc_url);
                 let no_check = sub.get_flag("no-check");
 
                 if ctx.json {
@@ -1512,11 +1556,29 @@ mod tests {
 
     // ---- network list --check (issue #411) ----
 
-    /// A live local endpoint: the listener accepts connections for the
-    /// lifetime of the returned handle.
+    /// A live local endpoint: the listener accepts connections and replies
+    /// with a healthy Soroban RPC `getHealth` payload.
     fn reachable_endpoint() -> (std::net::TcpListener, String) {
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let server = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            for stream in server.incoming().flatten() {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
         (listener, format!("http://127.0.0.1:{port}/soroban/rpc"))
     }
 

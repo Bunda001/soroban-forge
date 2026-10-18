@@ -175,3 +175,30 @@ fn claim_pre_cliff_fails() {
     env.ledger().with_mut(|li| li.timestamp = start_ts + 500);
     contract.claim();
 }
+
+#[test]
+#[should_panic(expected = "already funded")]
+fn fund_twice_is_rejected() {
+    let env = Env::default();
+    let (contract, token, admin, _beneficiary, _start_ts) = setup(&env);
+    token.admin.mint(&admin, &200_000);
+    contract.fund();
+    contract.fund();
+}
+
+#[test]
+fn admin_can_revoke_unvested_tokens() {
+    let env = Env::default();
+    let (contract, token, admin, beneficiary, start_ts) = setup(&env);
+    token.admin.mint(&admin, &100_000);
+    contract.fund();
+
+    env.ledger().with_mut(|li| li.timestamp = start_ts + 3000);
+    let revoked = contract.revoke();
+    assert_eq!(revoked, 50_000);
+    assert_eq!(token.client.balance(&admin), 50_000);
+
+    let claimed = contract.claim();
+    assert_eq!(claimed, 50_000);
+    assert_eq!(token.client.balance(&beneficiary), 50_000);
+}

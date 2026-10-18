@@ -126,11 +126,17 @@ impl YieldVaultContract {
     /// Deposit `assets` of the underlying token into the vault in exchange for shares.
     ///
     /// Shares minted: `(assets * total_shares) / total_assets` (rounded down).
+    /// The first deposit into an empty vault must be at least `100` units to
+    /// prevent dust-share inflation attacks (#519).
     pub fn deposit(env: Env, from: Address, assets: i128) -> Result<i128, VaultError> {
         from.require_auth();
 
         if assets <= 0 {
             return Err(VaultError::ZeroAmount);
+        }
+
+        if Self::total_shares(env.clone()) == 0 && assets < 100 {
+            return Err(VaultError::ZeroShares);
         }
 
         let asset_address = Self::asset(env.clone())?;
