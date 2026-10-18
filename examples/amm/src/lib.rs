@@ -37,6 +37,8 @@ pub enum Error {
     /// A deposit's implied ratio fell outside the caller's tolerance, or a
     /// withdrawal returned less than the caller's stated minimum.
     RatioOutOfRange = 4,
+    /// The two pool reserve tokens must be distinct.
+    IdenticalTokens = 5,
 }
 
 #[contracttype]
@@ -138,6 +140,9 @@ impl LiquidityPool {
     /// Initialise the pool over two distinct token contracts. Reserves and
     /// shares start at zero.
     pub fn __constructor(env: Env, token_a: Address, token_b: Address) {
+        if token_a == token_b {
+            panic_with_error!(&env, Error::IdenticalTokens);
+        }
         env.storage().instance().set(&DataKey::TokenA, &token_a);
         env.storage().instance().set(&DataKey::TokenB, &token_b);
         env.storage().instance().set(&DataKey::ReserveA, &0i128);

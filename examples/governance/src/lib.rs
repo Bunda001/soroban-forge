@@ -24,6 +24,10 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 /// Votes counted for each eligible voter.
 pub const VOTE_WEIGHT: i128 = 1;
 
+pub const DAY_IN_LEDGERS: u32 = 17_280;
+pub const PERSISTENT_TTL: u32 = 30 * DAY_IN_LEDGERS;
+pub const PERSISTENT_TTL_THRESHOLD: u32 = PERSISTENT_TTL - DAY_IN_LEDGERS;
+
 /// A governance proposal.
 #[contracttype]
 #[derive(Clone)]
@@ -76,7 +80,7 @@ fn admin(env: &Env) -> Address {
 fn voting_power(env: &Env, voter: &Address, proposal: &Proposal) -> i128 {
     match env
         .storage()
-        .instance()
+        .persistent()
         .get::<_, u32>(&DataKey::MemberSince(voter.clone()))
     {
         Some(since) if since <= proposal.created_ledger => VOTE_WEIGHT,
@@ -114,12 +118,15 @@ impl GovernanceContract {
     pub fn add_member(env: Env, member: Address) {
         admin(&env).require_auth();
         let key = DataKey::MemberSince(member);
-        if env.storage().instance().has(&key) {
+        if env.storage().persistent().has(&key) {
             panic!("already a member");
         }
         env.storage()
-            .instance()
+            .persistent()
             .set(&key, &env.ledger().sequence());
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
         let count: u32 = Self::member_count(env.clone());
         env.storage()
             .instance()
@@ -131,10 +138,10 @@ impl GovernanceContract {
     pub fn remove_member(env: Env, member: Address) {
         admin(&env).require_auth();
         let key = DataKey::MemberSince(member);
-        if !env.storage().instance().has(&key) {
+        if !env.storage().persistent().has(&key) {
             panic!("not a member");
         }
-        env.storage().instance().remove(&key);
+        env.storage().persistent().remove(&key);
         let count: u32 = Self::member_count(env.clone());
         env.storage()
             .instance()
@@ -144,7 +151,7 @@ impl GovernanceContract {
     /// Whether `address` is currently a registered member.
     pub fn is_member(env: Env, address: Address) -> bool {
         env.storage()
-            .instance()
+            .persistent()
             .has(&DataKey::MemberSince(address))
     }
 
@@ -187,9 +194,11 @@ impl GovernanceContract {
             votes_against: 0,
             executed: false,
         };
+        let key = DataKey::Proposal(id);
+        env.storage().persistent().set(&key, &proposal);
         env.storage()
-            .instance()
-            .set(&DataKey::Proposal(id), &proposal);
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
         env.storage()
             .instance()
             .set(&DataKey::NextId, &(id + 1));
@@ -208,14 +217,15 @@ impl GovernanceContract {
 
         // Prevent double-voting.
         let voted_key = DataKey::Voted(proposal_id, voter.clone());
-        if env.storage().instance().has(&voted_key) {
+        if env.storage().persistent().has(&voted_key) {
             panic!("already voted on this proposal");
         }
 
+        let prop_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = env
             .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
+            .persistent()
+            .get(&prop_key)
             .expect("proposal not found");
 
         if env.ledger().sequence() > proposal.voting_deadline {
@@ -233,10 +243,14 @@ impl GovernanceContract {
             proposal.votes_against += power;
         }
 
+        env.storage().persistent().set(&prop_key, &proposal);
         env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-        env.storage().instance().set(&voted_key, &true);
+            .persistent()
+            .extend_ttl(&prop_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
+        env.storage().persistent().set(&voted_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&voted_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
     }
 
     /// Execute a proposal after its voting period has ended.
@@ -246,10 +260,11 @@ impl GovernanceContract {
     /// 2. Total votes meet or exceed the configured quorum.
     /// 3. Votes in favour exceed votes against.
     pub fn execute_proposal(env: Env, proposal_id: u64) {
+        let prop_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = env
             .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
+            .persistent()
+            .get(&prop_key)
             .expect("proposal not found");
 
         if env.ledger().sequence() <= proposal.voting_deadline {
@@ -273,9 +288,10 @@ impl GovernanceContract {
         }
 
         proposal.executed = true;
+        env.storage().persistent().set(&prop_key, &proposal);
         env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+            .persistent()
+            .extend_ttl(&prop_key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
 
         // TODO: trigger on-chain action here (e.g. call another contract).
     }
@@ -283,7 +299,7 @@ impl GovernanceContract {
     /// Return the current state of a proposal.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Proposal(proposal_id))
             .expect("proposal not found")
     }
