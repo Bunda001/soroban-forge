@@ -121,6 +121,12 @@ impl StakingContract {
             panic_with_error!(&env, Error::InvalidAmount);
         }
         _claim(&env, &user);
+        let tok = token(&env);
+        soroban_sdk::token::Client::new(&env, &tok).transfer(
+            &user,
+            &env.current_contract_address(),
+            &amount,
+        );
         let new = read_staked(&env, &user) + amount;
         write_staked(&env, &user, new);
         let new_debt = new
@@ -150,6 +156,12 @@ impl StakingContract {
             / SCALE;
         set_reward_debt(&env, &user, new_debt);
         set_total_staked(&env, total_staked(&env) - amount);
+        let tok = token(&env);
+        soroban_sdk::token::Client::new(&env, &tok).transfer(
+            &env.current_contract_address(),
+            &user,
+            &amount,
+        );
         env.events().publish((symbol_short!("withdraw"), user), amount);
     }
 

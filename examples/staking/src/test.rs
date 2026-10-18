@@ -3,6 +3,9 @@ use soroban_sdk::testutils::{Address as _, Events as _};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 use soroban_sdk::{Address, Env};
 
+/// What `setup` mints to each of Alice and Bob, so they can deposit.
+const USER_FUNDS: i128 = 10_000_000_000;
+
 fn setup(env: &Env) -> (StakingContractClient<'_>, TokenClient<'_>, Address, Address, Address) {
     env.mock_all_auths();
     let admin = Address::generate(env);
@@ -13,11 +16,63 @@ fn setup(env: &Env) -> (StakingContractClient<'_>, TokenClient<'_>, Address, Add
     let token = TokenClient::new(env, &token_id);
     let sac = StellarAssetClient::new(env, &token_id);
     sac.mint(&admin, &10_000_000_000);
+    sac.mint(&alice, &USER_FUNDS);
+    sac.mint(&bob, &USER_FUNDS);
 
     let staking_id = env.register(StakingContract, (admin.clone(), token_id));
     let staking = StakingContractClient::new(env, &staking_id);
 
     (staking, token, admin, alice, bob)
+}
+
+#[test]
+fn deposit_moves_tokens_into_contract() {
+    let env = Env::default();
+    let (staking, token, _admin, alice, _bob) = setup(&env);
+
+    assert_eq!(token.balance(&alice), USER_FUNDS);
+    staking.deposit(&alice, &1000);
+    assert_eq!(staking.get_staked(&alice), 1000);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 1000);
+    assert_eq!(token.balance(&staking.address), 1000);
+}
+
+#[test]
+fn withdraw_moves_tokens_back_to_user() {
+    let env = Env::default();
+    let (staking, token, _admin, alice, _bob) = setup(&env);
+
+    staking.deposit(&alice, &1000);
+    staking.withdraw(&alice, &1000);
+    assert_eq!(staking.get_staked(&alice), 0);
+    assert_eq!(token.balance(&alice), USER_FUNDS);
+    assert_eq!(token.balance(&staking.address), 0);
+}
+
+#[test]
+fn rewards_only_split_among_deposited_tokens() {
+    let env = Env::default();
+    let (staking, token, _admin, alice, bob) = setup(&env);
+
+    staking.deposit(&alice, &1000);
+    staking.distribute(&500);
+
+    // Bob never deposited, so he has nothing pending.
+    assert_eq!(staking.get_pending_reward(&bob), 0);
+    assert_eq!(token.balance(&bob), USER_FUNDS);
+
+    assert_eq!(staking.claim(&alice), 500);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 1000 + 500);
+    assert_eq!(token.balance(&staking.address), 1000);
+}
+
+#[test]
+#[should_panic]
+fn deposit_without_balance_fails() {
+    let env = Env::default();
+    let (staking, _token, _admin, _alice, _bob) = setup(&env);
+    let broke = Address::generate(&env);
+    staking.deposit(&broke, &1000);
 }
 
 #[test]
@@ -33,7 +88,8 @@ fn single_staker_distribution() {
 
     let claimed = staking.claim(&alice);
     assert_eq!(claimed, 500);
-    assert_eq!(token.balance(&alice), 500);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 1000 + 500);
+    assert_eq!(token.balance(&staking.address), 1000);
 }
 
 #[test]
@@ -53,8 +109,8 @@ fn multi_staker_proportional_distribution() {
     // Alice: 1/4 of 400 = 100, Bob: 3/4 of 400 = 300
     assert_eq!(alice_claimed, 100);
     assert_eq!(bob_claimed, 300);
-    assert_eq!(token.balance(&alice), 100);
-    assert_eq!(token.balance(&bob), 300);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 1000 + 100);
+    assert_eq!(token.balance(&bob), USER_FUNDS - 3000 + 300);
 }
 
 #[test]
@@ -108,7 +164,7 @@ fn claim_after_multiple_distributions() {
 
     let claimed = staking.claim(&alice);
     assert_eq!(claimed, 500);
-    assert_eq!(token.balance(&alice), 500);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 1000 + 500);
 }
 
 #[test]
@@ -120,10 +176,11 @@ fn withdraw_claims_pending_first() {
     staking.distribute(&500);
     staking.withdraw(&alice, &500);
 
-    // withdraw triggered internal claim of 500, then withdrew 500
+    // withdraw triggered internal claim of 500, then returned 500 of stake
     assert_eq!(staking.get_staked(&alice), 500);
     assert_eq!(staking.get_total_staked(), 500);
-    assert_eq!(token.balance(&alice), 500);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 1000 + 500 + 500);
+    assert_eq!(token.balance(&staking.address), 500);
 }
 
 #[test]
@@ -143,8 +200,8 @@ fn rounding_handling() {
     // some dust may be lost to rounding
     assert_eq!(alice_claimed, 3);
     assert_eq!(bob_claimed, 6);
-    assert_eq!(token.balance(&alice), 3);
-    assert_eq!(token.balance(&bob), 6);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 100 + 3);
+    assert_eq!(token.balance(&bob), USER_FUNDS - 200 + 6);
     // 1 unit lost to integer rounding
     assert_eq!(alice_claimed + bob_claimed, 9);
 }
@@ -162,8 +219,8 @@ fn multiple_users_can_deposit_before_rewards() {
     let b = staking.claim(&bob);
     assert_eq!(a, 500);
     assert_eq!(b, 500);
-    assert_eq!(token.balance(&alice), 500);
-    assert_eq!(token.balance(&bob), 500);
+    assert_eq!(token.balance(&alice), USER_FUNDS - 2000 + 500);
+    assert_eq!(token.balance(&bob), USER_FUNDS - 2000 + 500);
 }
 
 #[test]
@@ -283,7 +340,7 @@ fn distribute_near_scale_limit_succeeds() {
     let env = Env::default();
     // Mint twice the limit: once to distribute, once already held by the contract
     // (in practice the admin holds the tokens and transfers them in).
-    let (staking, token, _admin, alice, _bob) = setup_with_balance(&env, limit * 2);
+    let (staking, token, admin, alice, _bob) = setup_with_balance(&env, limit * 2);
 
     // Alice stakes 1 unit so total > 0.
     // Give Alice 1 token to deposit by minting directly to her.
@@ -301,10 +358,9 @@ fn distribute_near_scale_limit_succeeds() {
     // Alice is the sole staker so she should receive the full `limit`.
     let claimed = staking.claim(&alice);
     assert_eq!(claimed, limit);
-    // Alice was minted 1 token (deposit does not transfer tokens from the user in this
-    // contract — only rewards are transferred).  After claiming `limit` rewards her
-    // balance is 1 + limit.
-    assert_eq!(token.balance(&alice), 1 + limit);
+    // Alice's 1 minted token is still staked in the contract, so after claiming
+    // `limit` rewards her balance is exactly `limit`.
+    assert_eq!(token.balance(&alice), limit);
 }
 
 /// Distributing `i128::MAX / SCALE + 1` must panic with `Error::Overflow`
@@ -356,6 +412,6 @@ fn two_distributions_near_limit_accumulate_correctly() {
     // pending = 1 * (2 * quarter * SCALE) / SCALE = 2 * quarter.  No rounding.
     let claimed = staking.claim(&alice);
     assert_eq!(claimed, two_quarters);
-    // Alice was minted 1 token (deposit does not move user tokens in this contract).
-    assert_eq!(token.balance(&alice), 1 + two_quarters);
+    // Alice's 1 minted token is still staked in the contract.
+    assert_eq!(token.balance(&alice), two_quarters);
 }
