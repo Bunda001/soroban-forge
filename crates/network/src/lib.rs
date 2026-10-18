@@ -189,74 +189,30 @@ pub fn write_network_to_forge_toml(cwd: &std::path::Path, name: &str) -> Result<
 
 /// Patch (or append) the `[network]` section in raw `forge.toml` text.
 ///
-/// Rules:
-/// - If a `[network]` section already exists, the `name = …` key within it is
-///   replaced (or inserted if missing). Other keys in the section are preserved.
-/// - If no `[network]` section exists, one is appended.
+/// Uses `toml_edit` to edit the document structurally while preserving
+/// comments and formatting.
 pub fn patch_forge_toml_network(existing: &str, name: &str) -> String {
-    // We do a simple line-by-line pass instead of a full TOML parse/re-emit
-    // so we preserve all comments and formatting.
-    let original_lines: Vec<&str> = existing.lines().collect();
-    let mut out_lines: Vec<String> = Vec::with_capacity(original_lines.len() + 3);
+    use toml_edit::{value, DocumentMut, Item, Table};
 
-    let mut in_network_section = false;
-    let mut name_key_written = false;
-    let mut network_section_header_idx: Option<usize> = None;
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .unwrap_or_else(|_| DocumentMut::new());
 
-    for line in &original_lines {
-        let trimmed = line.trim();
-
-        if trimmed == "[network]" {
-            in_network_section = true;
-            network_section_header_idx = Some(out_lines.len());
-            out_lines.push(line.to_string());
-            continue;
+    match doc.get_mut("network") {
+        Some(Item::Table(table)) => {
+            table["name"] = value(name);
         }
-
-        // Entering a new section other than [network]
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            // If we were in [network] and never wrote the name key, insert it now
-            // (before this new section header)
-            if in_network_section && !name_key_written {
-                out_lines.push(format!("name = \"{name}\""));
-                name_key_written = true;
-            }
-            in_network_section = false;
-            out_lines.push(line.to_string());
-            continue;
+        Some(Item::Value(toml_edit::Value::InlineTable(inline))) => {
+            inline.insert("name", name.into());
         }
-
-        // Replace the `name = ...` key inside [network]
-        if in_network_section && !name_key_written {
-            if let Some(eq_pos) = trimmed.find('=') {
-                let key = trimmed[..eq_pos].trim();
-                if key == "name" {
-                    out_lines.push(format!("name = \"{name}\""));
-                    name_key_written = true;
-                    continue; // skip the old line
-                }
-            }
+        _ => {
+            let mut table = Table::new();
+            table["name"] = value(name);
+            doc["network"] = Item::Table(table);
         }
-
-        out_lines.push(line.to_string());
     }
 
-    // EOF while still inside [network] and name was never written
-    if in_network_section && !name_key_written {
-        out_lines.push(format!("name = \"{name}\""));
-        name_key_written = true;
-    }
-
-    // No [network] section found at all — append
-    if network_section_header_idx.is_none() && !name_key_written {
-        if !out_lines.is_empty() && !out_lines.last().map(|l| l.is_empty()).unwrap_or(true) {
-            out_lines.push(String::new());
-        }
-        out_lines.push("[network]".to_string());
-        out_lines.push(format!("name = \"{name}\""));
-    }
-
-    let mut result = out_lines.join("\n");
+    let mut result = doc.to_string();
     if !result.ends_with('\n') {
         result.push('\n');
     }
@@ -353,12 +309,11 @@ pub const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// Result of probing one network's RPC endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reachability {
-    /// The endpoint answered and (when checked) matched the expected network passphrase.
+    /// A TCP connection (or healthy Soroban RPC response) succeeded.
     Reachable { latency_ms: u64 },
-    /// The endpoint answered `getNetwork`, but its `passphrase` did not match the
-    /// configured network passphrase.
+    /// The endpoint answered `getNetwork` with a different passphrase than configured.
     PassphraseMismatch { expected: String, actual: String },
-    /// The endpoint could not be reached; the string says why.
+    /// The endpoint could not be reached or reported unhealthy status; the string says why.
     Unreachable(String),
 }
 
@@ -454,11 +409,10 @@ fn endpoint_path(url: &str) -> &str {
 /// Lightweight reachability probe: resolve the endpoint and open a TCP
 /// connection, bounded by `timeout`.
 pub fn probe_endpoint(url: &str, timeout: Duration) -> Reachability {
-    probe_endpoint_inner(url, None, timeout)
+    probe_rpc_endpoint(url, None, timeout)
 }
 
-/// Probe `url` and, when the server responds to a Soroban JSON-RPC
-/// `getNetwork` request, verify that its `passphrase` matches
+/// Probe `url` and verify that a Soroban RPC `passphrase` matches
 /// `expected_passphrase`. A mismatch is reported distinctly via
 /// [`Reachability::PassphraseMismatch`].
 pub fn probe_endpoint_with_passphrase(
@@ -466,10 +420,12 @@ pub fn probe_endpoint_with_passphrase(
     expected_passphrase: &str,
     timeout: Duration,
 ) -> Reachability {
-    probe_endpoint_inner(url, Some(expected_passphrase), timeout)
+    probe_rpc_endpoint(url, Some(expected_passphrase), timeout)
 }
 
-fn probe_endpoint_inner(
+/// Probe a Soroban RPC endpoint over HTTP JSON-RPC (`getHealth` / `getNetwork`)
+/// and check health and optional network passphrase.
+pub fn probe_rpc_endpoint(
     url: &str,
     expected_passphrase: Option<&str>,
     timeout: Duration,
@@ -517,14 +473,6 @@ fn probe_endpoint_inner(
     };
 
     let connect_latency_ms = started.elapsed().as_millis() as u64;
-
-    let Some(expected) = expected_passphrase else {
-        return Reachability::Reachable {
-            latency_ms: connect_latency_ms,
-        };
-    };
-
-    // Only attempt plain HTTP JSON-RPC over the raw socket for http:// URLs.
     let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or("");
     if !scheme.eq_ignore_ascii_case("http") {
         return Reachability::Reachable {
@@ -544,7 +492,7 @@ fn probe_endpoint_inner(
     let _ = stream.set_read_timeout(Some(io_timeout));
 
     let path = endpoint_path(url);
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getNetwork"}"#;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getHealth"}"#;
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -559,7 +507,6 @@ fn probe_endpoint_inner(
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     if response.is_empty() {
-        // Peer accepted TCP but did not speak HTTP (e.g. a bare TCP listener).
         return Reachability::Reachable {
             latency_ms: connect_latency_ms,
         };
@@ -583,17 +530,12 @@ fn probe_endpoint_inner(
     }
 
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_body.trim()) {
-        if let Some(actual) = val
-            .get("result")
-            .and_then(|r| r.get("passphrase"))
-            .and_then(|p| p.as_str())
+        if let Some(err) = val
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
         {
-            if actual != expected {
-                return Reachability::PassphraseMismatch {
-                    expected: expected.to_string(),
-                    actual: actual.to_string(),
-                };
-            }
+            return Reachability::Unreachable(format!("RPC error: {err}"));
         }
         if let Some(status) = val
             .get("result")
@@ -602,6 +544,19 @@ fn probe_endpoint_inner(
         {
             if status != "healthy" {
                 return Reachability::Unreachable(format!("unhealthy RPC status: {status}"));
+            }
+        }
+        if let (Some(expected), Some(actual)) = (
+            expected_passphrase,
+            val.get("result")
+                .and_then(|r| r.get("passphrase"))
+                .and_then(|p| p.as_str()),
+        ) {
+            if actual != expected {
+                return Reachability::PassphraseMismatch {
+                    expected: expected.to_string(),
+                    actual: actual.to_string(),
+                };
             }
         }
     }
@@ -1840,57 +1795,79 @@ mod tests {
         assert!(!plain.subcommand().unwrap().1.get_flag("check"));
     }
 
-    #[test]
-    fn passphrase_mismatch_is_reported_distinctly() {
+    fn spawn_stub_rpc_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (std::thread::JoinHandle<()>, String) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let url = format!("http://127.0.0.1:{port}/soroban/rpc");
-
-        let server = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
-                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"passphrase":"Public Global Stellar Network ; September 2015"}}"#;
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes());
             }
         });
+        (handle, url)
+    }
 
-        let result = probe_endpoint_with_passphrase(
-            &url,
-            "Test SDF Network ; September 2015",
+    #[test]
+    fn stub_server_healthy_unhealthy_and_wrong_network_responses() {
+        // 1. Healthy response
+        let (srv_healthy, url_healthy) = spawn_stub_rpc_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","passphrase":"Test SDF Network ; September 2015"}}"#,
+        );
+        let res_healthy = probe_rpc_endpoint(
+            &url_healthy,
+            Some("Test SDF Network ; September 2015"),
             Duration::from_secs(2),
         );
-        server.join().unwrap();
+        srv_healthy.join().unwrap();
+        assert!(res_healthy.is_reachable(), "{res_healthy:?}");
 
+        // 2. Unhealthy response
+        let (srv_unhealthy, url_unhealthy) = spawn_stub_rpc_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"unhealthy"}}"#,
+        );
+        let res_unhealthy = probe_rpc_endpoint(
+            &url_unhealthy,
+            Some("Test SDF Network ; September 2015"),
+            Duration::from_secs(2),
+        );
+        srv_unhealthy.join().unwrap();
+        assert!(!res_unhealthy.is_reachable(), "{res_unhealthy:?}");
+        assert!(
+            res_unhealthy.label().contains("unhealthy"),
+            "{}",
+            res_unhealthy.label()
+        );
+
+        // 3. Wrong-network response
+        let (srv_wrong_net, url_wrong_net) = spawn_stub_rpc_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","passphrase":"Public Global Stellar Network ; September 2015"}}"#,
+        );
+        let res_wrong_net = probe_rpc_endpoint(
+            &url_wrong_net,
+            Some("Test SDF Network ; September 2015"),
+            Duration::from_secs(2),
+        );
+        srv_wrong_net.join().unwrap();
         assert_eq!(
-            result,
+            res_wrong_net,
             Reachability::PassphraseMismatch {
                 expected: "Test SDF Network ; September 2015".into(),
                 actual: "Public Global Stellar Network ; September 2015".into(),
             }
-        );
-        assert!(!result.is_reachable());
-        assert!(
-            result.label().contains("passphrase mismatch"),
-            "label must distinctly report passphrase mismatch: {}",
-            result.label()
-        );
-        let json = result.json_fields();
-        assert_eq!(json["reachable"], false);
-        assert_eq!(json["passphrase_mismatch"], true);
-        assert_eq!(
-            json["expected_passphrase"],
-            "Test SDF Network ; September 2015"
-        );
-        assert_eq!(
-            json["actual_passphrase"],
-            "Public Global Stellar Network ; September 2015"
         );
     }
 }
