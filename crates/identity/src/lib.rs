@@ -182,8 +182,11 @@ pub fn write_identity_to_forge_toml(cwd: &std::path::Path, name: &str) -> Result
 
 /// Patch (or append) the `[identity]` section in raw `forge.toml` text.
 ///
-/// Uses `toml_edit` to edit the document structurally while preserving
-/// comments and formatting.
+/// Rules:
+/// - If an `[identity]` section (or `identity.default = ...` / `identity = { ... }`)
+///   already exists, the `default = …` key within it is replaced (or inserted
+///   if missing). Other keys and comments in the document are preserved.
+/// - If no `[identity]` section exists, one is appended.
 pub fn patch_forge_toml_identity(existing: &str, name: &str) -> String {
     use toml_edit::{value, DocumentMut, Item, Table};
 
@@ -2034,5 +2037,27 @@ mod tests {
             .try_get_matches_from(["identity", "show", "alice", "--reveal-secret"])
             .unwrap();
         assert!(m.subcommand().unwrap().1.get_flag("reveal-secret"));
+    }
+
+    #[test]
+    fn patch_forge_toml_identity_handles_comments_dotted_keys_inline_tables_and_quotes() {
+        let with_comment = "[identity] # active identity\ndefault = \"alice\"\n";
+        let out = patch_forge_toml_identity(with_comment, "bob");
+        let doc: toml_edit::DocumentMut = out.parse().expect("must be valid TOML");
+        assert_eq!(doc["identity"]["default"].as_str(), Some("bob"));
+        assert!(out.contains("# active identity"), "{out}");
+
+        let dotted = "identity.default = \"alice\"\n";
+        let out_dotted = patch_forge_toml_identity(dotted, "bob");
+        let doc_dotted: toml_edit::DocumentMut = out_dotted.parse().expect("must be valid TOML");
+        assert_eq!(doc_dotted["identity"]["default"].as_str(), Some("bob"));
+
+        let inline = "identity = { default = \"alice\" }\n";
+        let out_inline = patch_forge_toml_identity(inline, "bob\"quoted");
+        let doc_inline: toml_edit::DocumentMut = out_inline.parse().expect("must be valid TOML");
+        assert_eq!(
+            doc_inline["identity"]["default"].as_str(),
+            Some("bob\"quoted")
+        );
     }
 }

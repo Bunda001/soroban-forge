@@ -189,8 +189,11 @@ pub fn write_network_to_forge_toml(cwd: &std::path::Path, name: &str) -> Result<
 
 /// Patch (or append) the `[network]` section in raw `forge.toml` text.
 ///
-/// Uses `toml_edit` to edit the document structurally while preserving
-/// comments and formatting.
+/// Rules:
+/// - If a `[network]` section (or `network.name = ...` / `network = { ... }`)
+///   already exists, the `name = …` key within it is replaced (or inserted if
+///   missing). Other keys and comments in the document are preserved.
+/// - If no `[network]` section exists, one is appended.
 pub fn patch_forge_toml_network(existing: &str, name: &str) -> String {
     use toml_edit::{value, DocumentMut, Item, Table};
 
@@ -1811,6 +1814,25 @@ mod tests {
             .try_get_matches_from(["network", "list"])
             .unwrap();
         assert!(!plain.subcommand().unwrap().1.get_flag("check"));
+    }
+
+    #[test]
+    fn patch_forge_toml_network_handles_comments_dotted_keys_inline_tables_and_quotes() {
+        let with_comment = "[network] # selected network\nname = \"localnet\"\n";
+        let out = patch_forge_toml_network(with_comment, "testnet");
+        let doc: toml_edit::DocumentMut = out.parse().expect("must be valid TOML");
+        assert_eq!(doc["network"]["name"].as_str(), Some("testnet"));
+        assert!(out.contains("# selected network"), "{out}");
+
+        let dotted = "network.name = \"localnet\"\n";
+        let out_dotted = patch_forge_toml_network(dotted, "testnet");
+        let doc_dotted: toml_edit::DocumentMut = out_dotted.parse().expect("must be valid TOML");
+        assert_eq!(doc_dotted["network"]["name"].as_str(), Some("testnet"));
+
+        let inline = "network = { name = \"localnet\" }\n";
+        let out_inline = patch_forge_toml_network(inline, "net\"quoted");
+        let doc_inline: toml_edit::DocumentMut = out_inline.parse().expect("must be valid TOML");
+        assert_eq!(doc_inline["network"]["name"].as_str(), Some("net\"quoted"));
     }
 
     fn spawn_stub_rpc_server(
