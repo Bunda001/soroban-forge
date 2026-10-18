@@ -16,7 +16,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
+    Address, Env,
 };
 
 /// Swap fee numerator/denominator: 0.3% (997/1000), the Uniswap-v2 standard.
@@ -37,6 +38,10 @@ pub enum Error {
     /// A deposit's implied ratio fell outside the caller's tolerance, or a
     /// withdrawal returned less than the caller's stated minimum.
     RatioOutOfRange = 4,
+    /// The transaction deadline has passed.
+    DeadlineExpired = 5,
+    /// Arithmetic overflow in reserve/share calculation.
+    MathOverflow = 6,
 }
 
 #[contracttype]
@@ -92,8 +97,12 @@ fn get_shares(env: &Env, owner: &Address) -> i128 {
 }
 
 fn mint_shares(env: &Env, to: &Address, amount: i128) {
-    let new_owner = get_shares(env, to) + amount;
-    let new_total = get_total_shares(env) + amount;
+    let new_owner = get_shares(env, to)
+        .checked_add(amount)
+        .unwrap_or_else(|| panic_with_error!(env, Error::MathOverflow));
+    let new_total = get_total_shares(env)
+        .checked_add(amount)
+        .unwrap_or_else(|| panic_with_error!(env, Error::MathOverflow));
     env.storage()
         .instance()
         .set(&DataKey::Shares(to.clone()), &new_owner);
@@ -113,6 +122,16 @@ fn burn_shares(env: &Env, from: &Address, amount: i128) {
     env.storage()
         .instance()
         .set(&DataKey::TotalShares, &(get_total_shares(env) - amount));
+}
+
+fn checked_mul(env: &Env, a: i128, b: i128) -> i128 {
+    a.checked_mul(b)
+        .unwrap_or_else(|| panic_with_error!(env, Error::MathOverflow))
+}
+
+fn checked_add(env: &Env, a: i128, b: i128) -> i128 {
+    a.checked_add(b)
+        .unwrap_or_else(|| panic_with_error!(env, Error::MathOverflow))
 }
 
 /// Integer square root via Newton's method — used to size the first deposit's
@@ -145,6 +164,22 @@ impl LiquidityPool {
         env.storage().instance().set(&DataKey::TotalShares, &0i128);
     }
 
+    /// Deposit liquidity with an explicit ledger timestamp `deadline`.
+    pub fn deposit_with_deadline(
+        env: Env,
+        to: Address,
+        amount_a: i128,
+        min_a: i128,
+        amount_b: i128,
+        min_b: i128,
+        deadline: u64,
+    ) -> i128 {
+        if env.ledger().timestamp() > deadline {
+            panic_with_error!(&env, Error::DeadlineExpired);
+        }
+        Self::deposit(env, to, amount_a, min_a, amount_b, min_b)
+    }
+
     /// Deposit liquidity and receive pool shares.
     ///
     /// The first deposit sets the price and may use any positive amounts. For
@@ -173,14 +208,14 @@ impl LiquidityPool {
         let (final_a, final_b) = if reserve_a == 0 && reserve_b == 0 {
             (amount_a, amount_b)
         } else {
-            let implied_b = amount_a * reserve_b / reserve_a;
+            let implied_b = checked_mul(&env, amount_a, reserve_b) / reserve_a;
             if implied_b <= amount_b {
                 if implied_b < min_b {
                     panic_with_error!(&env, Error::RatioOutOfRange);
                 }
                 (amount_a, implied_b)
             } else {
-                let implied_a = amount_b * reserve_a / reserve_b;
+                let implied_a = checked_mul(&env, amount_b, reserve_a) / reserve_b;
                 if implied_a > amount_a || implied_a < min_a {
                     panic_with_error!(&env, Error::RatioOutOfRange);
                 }
@@ -195,10 +230,10 @@ impl LiquidityPool {
 
         // Mint shares.
         let minted = if total_shares == 0 {
-            sqrt(final_a * final_b)
+            sqrt(checked_mul(&env, final_a, final_b))
         } else {
-            let by_a = final_a * total_shares / reserve_a;
-            let by_b = final_b * total_shares / reserve_b;
+            let by_a = checked_mul(&env, final_a, total_shares) / reserve_a;
+            let by_b = checked_mul(&env, final_b, total_shares) / reserve_b;
             if by_a < by_b {
                 by_a
             } else {
@@ -209,9 +244,28 @@ impl LiquidityPool {
             panic_with_error!(&env, Error::InsufficientLiquidity);
         }
 
-        put_reserves(&env, reserve_a + final_a, reserve_b + final_b);
+        let new_reserve_a = checked_add(&env, reserve_a, final_a);
+        let new_reserve_b = checked_add(&env, reserve_b, final_b);
+        put_reserves(&env, new_reserve_a, new_reserve_b);
         mint_shares(&env, &to, minted);
+        env.events()
+            .publish((symbol_short!("deposit"), to), (final_a, final_b, minted));
         minted
+    }
+
+    /// Swap with an explicit ledger timestamp `deadline`.
+    pub fn swap_with_deadline(
+        env: Env,
+        to: Address,
+        buy_a: bool,
+        out: i128,
+        in_max: i128,
+        deadline: u64,
+    ) -> i128 {
+        if env.ledger().timestamp() > deadline {
+            panic_with_error!(&env, Error::DeadlineExpired);
+        }
+        Self::swap(env, to, buy_a, out, in_max)
     }
 
     /// Swap to buy exactly `out` units of one token, paying at most `in_max`
@@ -241,9 +295,9 @@ impl LiquidityPool {
         // input that keeps `k` non-decreasing, then round up by one unit:
         //   in = reserve_in * out * FEE_DEN
         //        / ((reserve_out - out) * FEE_NUM)  + 1
-        let numerator = reserve_in * out * FEE_DEN;
-        let denominator = (reserve_out - out) * FEE_NUM;
-        let in_amount = numerator / denominator + 1;
+        let numerator = checked_mul(&env, checked_mul(&env, reserve_in, out), FEE_DEN);
+        let denominator = checked_mul(&env, reserve_out - out, FEE_NUM);
+        let in_amount = checked_add(&env, numerator / denominator, 1);
         if in_amount > in_max {
             panic_with_error!(&env, Error::SlippageExceeded);
         }
@@ -259,10 +313,20 @@ impl LiquidityPool {
 
         // Update reserves according to direction.
         if buy_a {
-            put_reserves(&env, reserve_a - out, reserve_b + in_amount);
+            put_reserves(
+                &env,
+                reserve_a - out,
+                checked_add(&env, reserve_b, in_amount),
+            );
         } else {
-            put_reserves(&env, reserve_a + in_amount, reserve_b - out);
+            put_reserves(
+                &env,
+                checked_add(&env, reserve_a, in_amount),
+                reserve_b - out,
+            );
         }
+        env.events()
+            .publish((symbol_short!("swap"), to), (buy_a, in_amount, out));
         in_amount
     }
 
@@ -288,8 +352,8 @@ impl LiquidityPool {
 
         let reserve_a = get_reserve_a(&env);
         let reserve_b = get_reserve_b(&env);
-        let out_a = reserve_a * share_amount / total_shares;
-        let out_b = reserve_b * share_amount / total_shares;
+        let out_a = checked_mul(&env, reserve_a, share_amount) / total_shares;
+        let out_b = checked_mul(&env, reserve_b, share_amount) / total_shares;
         if out_a < min_a || out_b < min_b {
             panic_with_error!(&env, Error::RatioOutOfRange);
         }
@@ -301,6 +365,10 @@ impl LiquidityPool {
         token::Client::new(&env, &get_token_b(&env)).transfer(&pool, &to, &out_b);
 
         put_reserves(&env, reserve_a - out_a, reserve_b - out_b);
+        env.events().publish(
+            (symbol_short!("withdraw"), to),
+            (share_amount, out_a, out_b),
+        );
         (out_a, out_b)
     }
 

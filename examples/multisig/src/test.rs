@@ -202,3 +202,16 @@ fn threshold_getter_works() {
     let client = MultisigContractClient::new(&env, &account);
     assert_eq!(client.threshold(), 2);
 }
+
+#[test]
+fn rotate_signers_replaces_signers_and_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let account = setup(&env, 3, 2);
+    let client = MultisigContractClient::new(&env, &account);
+
+    let new_signers = generate_keys(&env, 2);
+    client.rotate_signers(&new_signers, &1);
+    assert_eq!(client.threshold(), 1);
+}
+

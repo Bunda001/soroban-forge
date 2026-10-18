@@ -31,6 +31,8 @@ pub enum AccError {
 enum DataKey {
     /// Number of configured signers (`N`).
     SignerCnt,
+    /// Current signer public keys.
+    Signers,
     /// Required number of signatures (`M`).
     Threshold,
     /// Marker entry per signer public key.
@@ -64,10 +66,48 @@ impl MultisigContract {
             }
             env.storage().instance().set(&DataKey::Signer(signer), &());
         }
+        env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage()
             .instance()
             .set(&DataKey::SignerCnt, &signers.len());
         env.storage().instance().set(&DataKey::Threshold, &threshold);
+    }
+
+    /// Atomically replace the signer set and threshold.
+    ///
+    /// Requires authorization from the contract itself (all current signers).
+    pub fn rotate_signers(env: Env, new_signers: Vec<BytesN<32>>, new_threshold: u32) {
+        env.current_contract_address().require_auth();
+        if new_threshold == 0 || new_threshold > new_signers.len() {
+            panic_with_error(&env, AccError::InvalidThreshold);
+        }
+
+        if let Some(old_signers) = env
+            .storage()
+            .instance()
+            .get::<_, Vec<BytesN<32>>>(&DataKey::Signers)
+        {
+            for signer in old_signers.iter() {
+                env.storage().instance().remove(&DataKey::Signer(signer));
+            }
+        }
+
+        for signer in new_signers.iter() {
+            if env.storage().instance().has(&DataKey::Signer(signer.clone())) {
+                panic_with_error(&env, AccError::DuplicateSigner);
+            }
+            env.storage().instance().set(&DataKey::Signer(signer), &());
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Signers, &new_signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerCnt, &new_signers.len());
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &new_threshold);
     }
 
     /// Change the signature threshold.

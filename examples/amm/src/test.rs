@@ -154,3 +154,20 @@ fn withdraw_below_min_panics() {
     // Demand far more token A out than the pool can return.
     pool.withdraw(&alice, &minted, &10_000, &1);
 }
+
+#[test]
+#[should_panic]
+fn swap_past_deadline_panics() {
+    use soroban_sdk::testutils::Ledger as _;
+    let env = Env::default();
+    let (pool, token_a, token_b, alice) = setup(&env);
+    token_a.admin.mint(&alice, &1_000);
+    token_b.admin.mint(&alice, &1_000);
+    pool.deposit(&alice, &1_000, &1_000, &1_000, &1_000);
+
+    env.ledger().with_mut(|li| li.timestamp = 200);
+    let trader = Address::generate(&env);
+    token_a.admin.mint(&trader, &1_000);
+    pool.swap_with_deadline(&trader, &false, &100, &1_000, &100);
+}
+
