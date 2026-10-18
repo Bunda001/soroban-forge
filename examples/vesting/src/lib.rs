@@ -26,6 +26,8 @@ pub enum DataKey {
     End,
     TotalAmount,
     Claimed,
+    Funded,
+    Revoked,
 }
 
 #[contract]
@@ -78,20 +80,74 @@ impl VestingContract {
             .instance()
             .set(&DataKey::TotalAmount, &total_amount);
         env.storage().instance().set(&DataKey::Claimed, &0_i128);
+        env.storage().instance().set(&DataKey::Funded, &false);
+        env.storage().instance().set(&DataKey::Revoked, &false);
     }
 
     /// Deposit the full vesting amount into this contract.
     ///
-    /// Must be called by the `admin` after `initialize`.
+    /// Must be called once by the `admin` after `initialize`.
     pub fn fund(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Funded)
+            .unwrap_or(false)
+        {
+            panic!("already funded");
+        }
+        env.storage().instance().set(&DataKey::Funded, &true);
 
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let total_amount: i128 = env.storage().instance().get(&DataKey::TotalAmount).unwrap();
 
         let client = token::Client::new(&env, &token);
         client.transfer(&admin, &env.current_contract_address(), &total_amount);
+    }
+
+    /// Revoke unvested tokens and return them to the `admin`, leaving already
+    /// vested tokens claimable by the beneficiary.
+    pub fn revoke(env: Env) -> i128 {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Revoked)
+            .unwrap_or(false)
+        {
+            panic!("already revoked");
+        }
+
+        let vested = Self::get_vested_amount(env.clone());
+        let total_amount: i128 = env.storage().instance().get(&DataKey::TotalAmount).unwrap();
+        let unvested = total_amount - vested;
+
+        env.storage().instance().set(&DataKey::Revoked, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAmount, &vested);
+        env.storage()
+            .instance()
+            .set(&DataKey::End, &env.ledger().timestamp());
+
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Funded)
+            .unwrap_or(false)
+            && unvested > 0
+        {
+            let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            let client = token::Client::new(&env, &token);
+            client.transfer(&env.current_contract_address(), &admin, &unvested);
+        }
+
+        unvested
     }
 
     /// Return the amount of tokens vested so far according to the schedule.

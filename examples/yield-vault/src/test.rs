@@ -227,3 +227,11 @@ fn test_cannot_add_yield_to_empty_vault() {
     asset.admin.mint(&provider, &1_000);
     vault.add_yield(&provider, &100);
 }
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_cannot_seed_empty_vault_with_dust_deposit() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.vault.deposit(&ctx.alice, &1);
+}

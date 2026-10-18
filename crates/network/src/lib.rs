@@ -1594,11 +1594,29 @@ mod tests {
 
     // ---- network list --check (issue #411) ----
 
-    /// A live local endpoint: the listener accepts connections for the
-    /// lifetime of the returned handle.
+    /// A live local endpoint: the listener accepts connections and replies
+    /// with a healthy Soroban RPC `getHealth` payload.
     fn reachable_endpoint() -> (std::net::TcpListener, String) {
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let server = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            for stream in server.incoming().flatten() {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
         (listener, format!("http://127.0.0.1:{port}/soroban/rpc"))
     }
 

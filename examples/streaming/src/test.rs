@@ -123,3 +123,25 @@ fn an_attacker_cannot_reinitialize_to_redirect_the_stream() {
     assert_eq!(token.client.balance(&attacker), 0);
 }
 
+#[test]
+#[should_panic(expected = "already funded")]
+fn fund_twice_is_rejected() {
+    let env = Env::default();
+    let (contract, token, sender, _recipient, _start_ts) = setup(&env);
+    token.admin.mint(&sender, &100_000);
+    contract.fund();
+}
+
+#[test]
+fn sender_can_cancel_stream() {
+    let env = Env::default();
+    let (contract, token, sender, recipient, start_ts) = setup(&env);
+
+    env.ledger().with_mut(|li| li.timestamp = start_ts + 2000);
+    let (recipient_paid, sender_refunded) = contract.cancel();
+    assert_eq!(recipient_paid, 50_000);
+    assert_eq!(sender_refunded, 50_000);
+    assert_eq!(token.client.balance(&recipient), 50_000);
+    assert_eq!(token.client.balance(&sender), 50_000);
+    assert_eq!(contract.get_claimable_amount(), 0);
+}
