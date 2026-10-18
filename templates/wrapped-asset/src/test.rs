@@ -116,3 +116,44 @@ fn unwrap_more_than_balance_fails() {
 
     contract.unwrap(&user, &200);
 }
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_twice_panics() {
+    let env = Env::default();
+    let (contract, token) = setup(&env);
+    contract.initialize(&token.address);
+}
+
+#[test]
+fn sep41_transfer_and_allowance_work_on_wrapped_balance() {
+    let env = Env::default();
+    let (contract, token) = setup(&env);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+    token.admin.mint(&alice, &1_000);
+
+    contract.wrap(&alice, &500);
+    assert_eq!(contract.balance(&alice), 500);
+
+    let wrapper_token = TokenClient::new(&env, &contract.address);
+    wrapper_token.transfer(&alice, &bob, &200);
+    assert_eq!(contract.balance(&alice), 300);
+    assert_eq!(contract.balance(&bob), 200);
+
+    wrapper_token.approve(&alice, &spender, &150, &1_000);
+    assert_eq!(wrapper_token.allowance(&alice, &spender), 150);
+
+    wrapper_token.transfer_from(&spender, &alice, &bob, &100);
+    assert_eq!(contract.balance(&alice), 200);
+    assert_eq!(contract.balance(&bob), 300);
+    assert_eq!(wrapper_token.allowance(&alice, &spender), 50);
+
+    // Bob can unwrap the wrapped tokens he received via transfer.
+    contract.unwrap(&bob, &300);
+    assert_eq!(contract.balance(&bob), 0);
+    assert_eq!(token.client.balance(&bob), 300);
+}
+

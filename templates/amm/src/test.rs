@@ -154,3 +154,16 @@ fn withdraw_below_min_panics() {
     // Demand far more token A out than the pool can return.
     pool.withdraw(&alice, &minted, &10_000, &1);
 }
+
+#[test]
+#[should_panic]
+fn constructor_rejects_identical_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let token_a = make_token(&env);
+    env.register(
+        LiquidityPool,
+        (token_a.address.clone(), token_a.address.clone()),
+    );
+}
+
