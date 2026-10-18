@@ -9,11 +9,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - `prediction-market` template: the constructor takes a resolution `deadline`
-  (a unix timestamp that must be in the future). `stake` and `resolve` fail
-  with `DeadlinePassed` from the deadline on, and a market that was never
-  resolved lets every participant `refund` their stakes, so an oracle that
-  never reports no longer locks funds forever. Deployments now pass
-  `--deadline <UNIX_TIMESTAMP>` (#582)
+  after `close_time` (`DeadlineBeforeClose` otherwise). `resolve` fails with
+  `DeadlinePassed` from the deadline on, and a market that was never resolved
+  lets every participant `refund` their stakes, so an oracle that never
+  reports no longer locks funds forever. Deployments now pass
+  `--close_time <UNIX_SECONDS> --deadline <UNIX_SECONDS>` (#582)
 - `soroban-forge optimize --all` optimizes every contract crate in a
   workspace in one invocation, reporting one result per contract (an array
   under `--json`) (#412)
@@ -78,6 +78,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   identity; the secret key is printed only with the explicit flag (#422)
 
 ### Fixed
+
+- Reject staking reward distributions to an empty pool with `Error::NoStakers`, without emitting a misleading `distrib` event (#572).
 
 - Concurrent writes to `identities.json` and `networks.json` no longer lose
   each other: every read-modify-write of either store (`identity
@@ -208,6 +210,10 @@ forge_tests` inside `src/`
 
 ### Security
 
+- Every action in the GitHub presets is now pinned to a commit SHA with a
+  `# <version>` comment, including `release.yml`, which runs with
+  `contents: write`. A unit test walks the embedded presets and fails on any
+  `uses:` that names a tag or branch instead (#609)
 - `governance` template: `cast_vote` no longer takes a caller-supplied
   `weight`, which let one voter pass any proposal (or subtract votes with a
   negative weight). Each admin-registered member now has exactly one vote,

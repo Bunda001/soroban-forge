@@ -72,7 +72,7 @@ stellar contract deploy \
   --wasm target/wasm32v1-none/release/prediction_market.wasm \
   --source-account <your-identity> \
   --network testnet \
-  -- --oracle <ORACLE_ADDRESS> --token <TOKEN_ADDRESS> --deadline <UNIX_TIMESTAMP>
+  -- --oracle <ORACLE_ADDRESS> --token <TOKEN_ADDRESS> --close_time <UNIX_SECONDS> --deadline <UNIX_SECONDS>
 ```
 
 ## Security

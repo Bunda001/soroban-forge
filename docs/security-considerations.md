@@ -137,15 +137,13 @@ single configured address:
   compromised oracle address controls every value this contract derives from
   it.
 - `prediction-market`'s `resolve` is gated on a single oracle address fixed
-  at deploy time and can only be called once, before a resolution deadline
-  that is also fixed at deploy time — there is no dispute window and no
-  recourse if that address resolves incorrectly. If it never resolves, the
-  deadline is the fallback: from then on `stake` and `resolve` are closed and
-  `refund` returns each participant's stakes, so funds are not locked forever.
-  The market still has no betting cutoff earlier than that deadline (stakes
-  are accepted until the oracle resolves it or the deadline is reached) and
-  pays out nothing if the resolved outcome has no backers; both are documented
-  as deliberate, narrow tradeoffs in the template's own README, not bugs.
+  at deploy time and can only be called once, between the betting close time
+  and a resolution deadline, both fixed at deploy time — there is no dispute
+  window and no recourse if that address resolves incorrectly. Staking closes
+  before the outcome can be reported. If the oracle never resolves, the
+  deadline is the fallback: from then on `resolve` is closed and `refund`
+  returns each participant's stakes, so funds are not locked forever. If the
+  resolved outcome has no backers, `claim` refunds each participant's stake.
 
 Neither template should be pointed at an oracle address you do not fully
 trust, and neither implements the multi-oracle aggregation or staleness
