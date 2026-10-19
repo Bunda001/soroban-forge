@@ -137,6 +137,108 @@ pub fn update_store<T>(
     })
 }
 
+fn add_network_to_store(
+    store: &mut NetworkStore,
+    name: &str,
+    rpc_url: Option<String>,
+    passphrase: Option<String>,
+    force: bool,
+) -> Result<Network> {
+    let existing = store.networks.get(name);
+    if existing.is_some() && !force {
+        return Err(ForgeError::AlreadyExists(PathBuf::from(name)));
+    }
+
+    if let Some(ref url) = rpc_url {
+        validate_rpc_url(url)?;
+    }
+
+    let preset = well_known(name);
+    if existing.is_none()
+        && preset.is_some()
+        && rpc_url.is_some() != passphrase.is_some()
+    {
+        return Err(ForgeError::InvalidArgument(format!(
+            "`{name}` is a built-in network; a partial override would pair a custom value with a preset value. Pass both --rpc-url and --passphrase to override it safely"
+        )));
+    }
+
+    let fallback = existing.or(preset.as_ref());
+    let network = match (rpc_url, passphrase, fallback) {
+        (Some(rpc_url), Some(network_passphrase), _) => Network {
+            rpc_url,
+            network_passphrase,
+        },
+        (rpc_url, passphrase, Some(fallback)) => Network {
+            rpc_url: rpc_url.unwrap_or_else(|| fallback.rpc_url.clone()),
+            network_passphrase: passphrase
+                .unwrap_or_else(|| fallback.network_passphrase.clone()),
+        },
+        _ => {
+            return Err(ForgeError::InvalidArgument(format!(
+                "`{name}` is not a well-known network — pass both --rpc-url and --passphrase"
+            )));
+        }
+    };
+
+    store.networks.insert(name.to_string(), network.clone());
+    if store.default.is_none() {
+        store.default = Some(name.to_string());
+    }
+    Ok(network)
+}
+
+fn export_networks(store: &NetworkStore, name: Option<&str>) -> Result<NetworkStore> {
+    let (networks, default) = match name {
+        Some(name) => {
+            let network = store.networks.get(name).cloned().ok_or_else(|| {
+                ForgeError::InvalidArgument(format!(
+                    "network `{name}` not found in the store"
+                ))
+            })?;
+            let mut networks = BTreeMap::new();
+            networks.insert(name.to_string(), network);
+            let default = (store.default.as_deref() == Some(name)).then(|| name.to_string());
+            (networks, default)
+        }
+        None => (store.networks.clone(), store.default.clone()),
+    };
+    Ok(NetworkStore { networks, default })
+}
+
+fn read_network_export(path: &PathBuf) -> Result<NetworkStore> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(ForgeError::io(format!("reading {}", path.display())))?;
+    serde_json::from_str(&raw).map_err(|e| ForgeError::Config {
+        path: path.clone(),
+        message: e.to_string(),
+    })
+}
+
+fn merge_networks(
+    store: &mut NetworkStore,
+    imported: NetworkStore,
+    force: bool,
+) -> Result<usize> {
+    if !force {
+        if let Some(name) = imported
+            .networks
+            .keys()
+            .find(|name| store.networks.contains_key(name.as_str()))
+        {
+            return Err(ForgeError::AlreadyExists(PathBuf::from(name.as_str())));
+        }
+    }
+
+    let imported_count = imported.networks.len();
+    let imported_default = imported.default;
+    store.networks.extend(imported.networks);
+    if store.default.is_none() {
+        store.default = imported_default;
+    }
+    Ok(imported_count)
+}
+
 /// Resolve a network by name: check the user store first, then fall back to
 /// built-in presets. This makes the three built-in networks (#289) available
 /// without any prior `network add` call.
@@ -762,6 +864,35 @@ impl ForgePlugin for NetworkPlugin {
                     ),
             )
             .subcommand(
+                Command::new("export")
+                    .about("Export stored network configs to a JSON file")
+                    .arg(
+                        Arg::new("file")
+                            .help("Destination JSON file")
+                            .required(true),
+                    )
+                    .arg(
+                        Arg::new("name")
+                            .long("name")
+                            .help("Export only this stored network"),
+                    ),
+            )
+            .subcommand(
+                Command::new("import")
+                    .about("Merge network configs from a JSON file")
+                    .arg(
+                        Arg::new("file")
+                            .help("Source JSON file")
+                            .required(true),
+                    )
+                    .arg(
+                        Arg::new("force")
+                            .long("force")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Overwrite stored networks with matching names"),
+                    ),
+            )
+            .subcommand(
                 Command::new("list")
                     .about("List all configured networks (including built-in presets)")
                     .arg(
@@ -816,42 +947,10 @@ impl ForgePlugin for NetworkPlugin {
                 let name = sub.get_one::<String>("name").unwrap();
                 let force = sub.get_flag("force");
 
+                let rpc_url = sub.get_one::<String>("rpc-url").cloned();
+                let passphrase = sub.get_one::<String>("passphrase").cloned();
                 let network = update_store(&path, |store| {
-                    if store.networks.contains_key(name.as_str()) && !force {
-                        return Err(ForgeError::AlreadyExists(PathBuf::from(name.as_str())));
-                    }
-
-                    let rpc_url = sub.get_one::<String>("rpc-url").cloned();
-                    let passphrase = sub.get_one::<String>("passphrase").cloned();
-
-                    // #405 — validate the URL before storing it
-                    if let Some(ref url) = rpc_url {
-                        validate_rpc_url(url)?;
-                    }
-
-                    let preset = well_known(name.as_str());
-
-                    let network = match (rpc_url, passphrase, preset) {
-                        (Some(rpc_url), Some(network_passphrase), _) => Network {
-                            rpc_url,
-                            network_passphrase,
-                        },
-                        (rpc_url, passphrase, Some(preset)) => Network {
-                            rpc_url: rpc_url.unwrap_or(preset.rpc_url),
-                            network_passphrase: passphrase.unwrap_or(preset.network_passphrase),
-                        },
-                        _ => {
-                            return Err(ForgeError::InvalidArgument(format!(
-                                "`{name}` is not a well-known network — pass both --rpc-url and --passphrase"
-                            )));
-                        }
-                    };
-
-                    store.networks.insert(name.clone(), network.clone());
-                    if store.default.is_none() {
-                        store.default = Some(name.clone());
-                    }
-                    Ok(network)
+                    add_network_to_store(store, name, rpc_url, passphrase, force)
                 })?;
 
                 if ctx.json {
@@ -878,6 +977,44 @@ impl ForgePlugin for NetworkPlugin {
                     // typo'd or offline URL surfaces here instead of at the next
                     // deploy/invoke/verify.
                     check_endpoint_and_warn(ctx, sub.get_flag("no-check"), name, &network.rpc_url);
+                }
+                Ok(())
+            }
+
+            Some(("export", sub)) => {
+                let output = PathBuf::from(sub.get_one::<String>("file").unwrap());
+                let name = sub.get_one::<String>("name").map(String::as_str);
+                let store = load_store(&path)?;
+                let exported = export_networks(&store, name)?;
+                let count = exported.networks.len();
+                save_store(&output, &exported)?;
+
+                if ctx.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"file": output, "networks": count})
+                    );
+                } else if !ctx.quiet {
+                    println!("exported {count} network(s) to {}", output.display());
+                }
+                Ok(())
+            }
+
+            Some(("import", sub)) => {
+                let input = PathBuf::from(sub.get_one::<String>("file").unwrap());
+                let force = sub.get_flag("force");
+                let imported = read_network_export(&input)?;
+                let count = update_store(&path, |store| {
+                    merge_networks(store, imported, force)
+                })?;
+
+                if ctx.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"file": input, "networks": count})
+                    );
+                } else if !ctx.quiet {
+                    println!("imported {count} network(s) from {}", input.display());
                 }
                 Ok(())
             }
@@ -1120,6 +1257,125 @@ mod tests {
     }
 
     #[test]
+    fn export_import_round_trip_preserves_networks_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-networks.json");
+        let mut source = NetworkStore::default();
+        source.networks.insert(
+            "teamnet".into(),
+            Network {
+                rpc_url: "https://team-rpc.example.com".into(),
+                network_passphrase: "Team Network".into(),
+            },
+        );
+        source.networks.insert(
+            "othernet".into(),
+            Network {
+                rpc_url: "https://other-rpc.example.com".into(),
+                network_passphrase: "Other Network".into(),
+            },
+        );
+        source.default = Some("teamnet".into());
+
+        let exported = export_networks(&source, None).unwrap();
+        let subset = export_networks(&source, Some("teamnet")).unwrap();
+        assert_eq!(subset.networks.len(), 1);
+        assert!(subset.networks.contains_key("teamnet"));
+        assert_eq!(subset.default.as_deref(), Some("teamnet"));
+
+        save_store(&path, &exported).unwrap();
+        let imported = read_network_export(&path).unwrap();
+        let mut destination = NetworkStore::default();
+
+        let count = merge_networks(&mut destination, imported, false).unwrap();
+
+        assert_eq!(count, source.networks.len());
+        assert_eq!(destination.networks, source.networks);
+        assert_eq!(destination.default, source.default);
+    }
+
+    #[test]
+    fn import_collisions_require_force() {
+        let mut destination = NetworkStore::default();
+        destination.networks.insert(
+            "teamnet".into(),
+            Network {
+                rpc_url: "https://old-rpc.example.com".into(),
+                network_passphrase: "Old Passphrase".into(),
+            },
+        );
+        let mut imported = NetworkStore::default();
+        imported.networks.insert(
+            "teamnet".into(),
+            Network {
+                rpc_url: "https://new-rpc.example.com".into(),
+                network_passphrase: "New Passphrase".into(),
+            },
+        );
+
+        assert!(merge_networks(&mut destination, imported.clone(), false).is_err());
+        assert_eq!(
+            destination.networks["teamnet"].rpc_url,
+            "https://old-rpc.example.com"
+        );
+
+        merge_networks(&mut destination, imported, true).unwrap();
+        assert_eq!(
+            destination.networks["teamnet"].rpc_url,
+            "https://new-rpc.example.com"
+        );
+    }
+
+    #[test]
+    fn force_update_of_rpc_url_preserves_existing_passphrase() {
+        let mut store = NetworkStore::default();
+        store.networks.insert(
+            "customnet".into(),
+            Network {
+                rpc_url: "https://old-rpc.example.com".into(),
+                network_passphrase: "Existing Passphrase".into(),
+            },
+        );
+
+        let updated = add_network_to_store(
+            &mut store,
+            "customnet",
+            Some("https://new-rpc.example.com".into()),
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(updated.rpc_url, "https://new-rpc.example.com");
+        assert_eq!(updated.network_passphrase, "Existing Passphrase");
+        assert_eq!(store.networks["customnet"], updated);
+    }
+
+    #[test]
+    fn partial_builtin_overrides_require_both_fields() {
+        for (rpc_url, passphrase) in [
+            (Some("https://custom-rpc.example.com".into()), None),
+            (None, Some("Custom Passphrase".into())),
+        ] {
+            let mut store = NetworkStore::default();
+
+            let err = add_network_to_store(
+                &mut store,
+                "testnet",
+                rpc_url,
+                passphrase,
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(err.contains("partial override"), "{err}");
+            assert!(err.contains("--rpc-url and --passphrase"), "{err}");
+            assert!(!store.networks.contains_key("testnet"));
+        }
+    }
+
+    #[test]
     fn load_missing_file_returns_empty_store() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.json");
@@ -1312,6 +1568,8 @@ mod tests {
         let cmd = plugin.command();
         let sub_names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         assert!(sub_names.contains(&"add"));
+        assert!(sub_names.contains(&"export"));
+        assert!(sub_names.contains(&"import"));
         assert!(sub_names.contains(&"list"));
         assert!(sub_names.contains(&"use"));
         // #467/#404 — remove subcommand must exist

@@ -591,16 +591,21 @@ fn fetch_onchain_wasm(
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            Err(ForgeError::Other(format!(
-                "stellar contract fetch failed — check the contract ID and the network it is \
-                 deployed on:\n{stderr}"
-            )))
+            Err(fetch_failure_error(network, &stderr))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(ForgeError::ToolMissing("stellar-cli".into()))
         }
         Err(e) => Err(ForgeError::io("running stellar contract fetch")(e)),
     }
+}
+
+fn fetch_failure_error(network: &NetworkArgs, stderr: &str) -> ForgeError {
+    ForgeError::Other(format!(
+        "stellar contract fetch failed on {} — check the contract ID and the network it is \
+         deployed on:\n{stderr}",
+        network.label()
+    ))
 }
 
 /// Read a wasm's interface as JSON with `stellar contract info interface`.
@@ -1166,6 +1171,16 @@ mod tests {
         let network = NetworkArgs::resolve(None, None, None, None);
         assert_eq!(network.label(), "testnet");
         assert_eq!(network.cli_args(), vec!["--network", "testnet"]);
+    }
+
+    #[test]
+    fn fetch_failure_includes_network_label_and_stderr() {
+        let network = NetworkArgs::resolve(Some("mainnet".into()), None, None, None);
+
+        let err = fetch_failure_error(&network, "contract not found").to_string();
+
+        assert!(err.contains("mainnet"), "{err}");
+        assert!(err.contains("contract not found"), "{err}");
     }
 
     #[test]
